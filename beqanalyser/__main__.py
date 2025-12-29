@@ -1,3 +1,6 @@
+import logging
+import sys
+
 import numpy as np
 
 from itertools import groupby
@@ -9,6 +12,10 @@ from beqanalyser.reporter import summarize_assignments, plot_histograms_from_tab
     plot_rms_max_scatter, print_assignments
 
 if __name__ == '__main__':
+    rootLogger = logging.getLogger()
+    rootLogger.addHandler(logging.StreamHandler(sys.stdout))
+    rootLogger.setLevel(logging.INFO)
+
     min_freq = 5
     max_freq = 50
     fan_counts = (5, 10, 20, 50, 100)

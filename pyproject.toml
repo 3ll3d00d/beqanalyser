@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Analyses the beqcatalogue to extract a smaller number of composite curves"
 requires-python = ">=3.13"
 dependencies = [
+    "ipykernel>=7.1.0",
     "matplotlib>=3.10.8",
     "numpy>=2.4.0",
     "requests>=2.32.5",

@@ -45,18 +45,30 @@ def assign_to_composites_with_record(
         cosine_limit: float,
         derivative_limit: float,
         entry_idx: int,
-        weights: np.ndarray | None = None
+        weights: np.ndarray | None = None,
+        rms_epsilon: float = 1.0
 ) -> AssignmentRecord:
-    best_comp: BEQComposite | None = None
-    best_comp_idx: int | None = None
-
-    best_rms: float = np.inf
-    best_max: float = np.inf
-    best_deriv: float = np.inf
-    best_cos: float = -1.0
-
-    rejection: RejectionReason | None = None
-    rms_val = max_val = deriv_val = cos_val = None
+    """
+    Assign entry to composites using two-stage selection:
+    1. Find composites within rms_epsilon of minimum RMS
+    2. Among those, select the one with highest cosine similarity
+    
+    Args:
+        entry: Input curve to assign
+        composites: List of composite candidates
+        rms_limit: Maximum acceptable RMS deviation
+        max_limit: Maximum acceptable absolute deviation
+        cosine_limit: Minimum acceptable cosine similarity
+        derivative_limit: Maximum acceptable derivative RMS
+        entry_idx: Index of entry in catalogue
+        weights: Optional frequency weights for RMS calculation
+        rms_epsilon: Tolerance for selecting near-minimum RMS composites
+    
+    Returns:
+        AssignmentRecord with assignment or rejection details
+    """
+    # Store all composite evaluations
+    composite_metrics = []
 
     for comp_idx, comp in enumerate(composites):
         delta = entry - comp.shape
@@ -65,6 +77,7 @@ def assign_to_composites_with_record(
         entry_deriv = derivative_rms(delta)
         entry_cos = cosine_similarity(entry, comp.shape)
 
+        # Determine rejection reason for this composite
         reject: RejectionReason | None = None
         if entry_rms > rms_limit and entry_max > max_limit:
             reject = RejectionReason.BOTH_EXCEEDED
@@ -77,19 +90,35 @@ def assign_to_composites_with_record(
         elif entry_deriv > derivative_limit:
             reject = RejectionReason.DERIVATIVE_TOO_HIGH
 
-        # Track closest composite regardless
-        if entry_rms < best_rms:
-            best_rms = entry_rms
-            best_max = entry_max
-            best_deriv = entry_deriv
-            best_cos = entry_cos
-            best_comp = comp
-            best_comp_idx = comp_idx
-            rejection = reject
-            rms_val, max_val, deriv_val, cos_val = entry_rms, entry_max, entry_deriv, entry_cos
+        composite_metrics.append({
+            'comp_idx': comp_idx,
+            'comp': comp,
+            'rms': entry_rms,
+            'max': entry_max,
+            'deriv': entry_deriv,
+            'cos': entry_cos,
+            'reject': reject
+        })
+
+    # Stage 1: Find minimum RMS
+    min_rms = min(m['rms'] for m in composite_metrics)
+
+    # Stage 2: Filter composites within epsilon of minimum RMS
+    candidates = [m for m in composite_metrics if m['rms'] <= min_rms + rms_epsilon]
+
+    # Stage 3: Among candidates, select highest cosine similarity
+    best_metric = max(candidates, key=lambda m: m['cos'])
+
+    best_comp = best_metric['comp']
+    best_comp_idx = best_metric['comp_idx']
+    best_rms = best_metric['rms']
+    best_max = best_metric['max']
+    best_deriv = best_metric['deriv']
+    best_cos = best_metric['cos']
+    rejection = best_metric['reject']
 
     # --- ASSIGN OR REJECT (but ALWAYS RECORD composite) ---
-    if rejection is None and best_comp is not None:
+    if rejection is None:
         comp = best_comp
         comp.assigned_indices.append(entry_idx)
         comp.deltas.append(best_rms)
@@ -115,13 +144,13 @@ def assign_to_composites_with_record(
     # --- REJECTED, BUT COMPOSITE ATTRIBUTED ---
     return AssignmentRecord(
         entry_index=entry_idx,
-        assigned_composite=best_comp_idx,  # <<< FIX
+        assigned_composite=best_comp_idx,
         rejected=True,
         rejection_reason=rejection,
-        rms_value=rms_val,
-        max_value=max_val,
-        derivative_value=deriv_val,
-        cosine_value=cos_val
+        rms_value=best_rms,
+        max_value=best_max,
+        derivative_value=best_deriv,
+        cosine_value=best_cos
     )
 
 
@@ -180,7 +209,8 @@ def build_beq_composites(
         cosine_limit: float = 0.95,
         derivative_limit: float = 2.0,
         fan_counts: tuple[int, ...] = (5,),
-        n_prototypes: int = 50
+        n_prototypes: int = 50,
+        rms_epsilon: float = 0.5
 ) -> BEQCompositePipelineResult:
     band_mask: np.ndarray = (freqs >= band[0]) & (freqs <= band[1])
     catalogue: np.ndarray = responses_db[:, band_mask]
@@ -208,10 +238,9 @@ def build_beq_composites(
     # Step 4: assign all entries
     assignment_table: list[AssignmentRecord] = []
     for i, entry in enumerate(catalogue):
-        record: AssignmentRecord = assign_to_composites_with_record(entry, composites,
-                                                                    rms_limit, max_limit,
-                                                                    cosine_limit, derivative_limit,
-                                                                    i, weights=band_weights)
+        record: AssignmentRecord = assign_to_composites_with_record(entry, composites, rms_limit, max_limit,
+                                                                    cosine_limit, derivative_limit, i,
+                                                                    weights=band_weights, rms_epsilon=rms_epsilon)
         assignment_table.append(record)
 
     # Step 5: recompute median composite shapes
