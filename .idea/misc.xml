@@ -6,4 +6,7 @@
   <component name="ProjectRootManager" version="2" project-jdk-name="uv (beqanalyser)" project-jdk-type="Python SDK">
     <output url="file://$PROJECT_DIR$/out" />
   </component>
+  <component name="RuffConfiguration">
+    <option name="enabled" value="true" />
+  </component>
 </project>

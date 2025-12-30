@@ -63,11 +63,11 @@ No single metric is sufficient to capture perceptual similarity in infra-bass BE
 
 #### Composite Selection
 
-When assigning a curve to a composite, the “closest” composite is selected based on **minimum RMS deviation**.
+When assigning a curve to a composite, the “best” composite is selected by selecting the highest cosine similarity from the composites with an RMS deviation within epsilon of the minimum RMS deviation.
 
-Other similarity metrics (maximum deviation, cosine similarity, derivative RMS) are used exclusively as **acceptance or rejection thresholds** and do not influence the ranking of candidate composites.
+Other similarity metrics (maximum deviation, derivative RMS) are used exclusively as **acceptance or rejection thresholds** and do not influence the ranking of candidate composites.
 
-As a result, RMS is the primary metric determining composite assignment, while the remaining metrics act as safeguards against perceptually dissimilar matches.
+As a result, RMS is the primary metric determining composite assignment with cosine similarity as a secondary tiebreaker, while the remaining metrics act as safeguards against perceptually dissimilar matches.
 
 #### Metric Weighting
 
@@ -237,7 +237,9 @@ Each composite contains:
 
 Composite curves are defined as the **per-frequency median** of all curves assigned to the composite.
 
-Median aggregation is used instead of a mean to reduce sensitivity to outliers and to produce a more robust representative shape. Composite curves are recomputed after assignment to reflect the current membership of each composite.
+Median aggregation is used instead of a mean to reduce sensitivity to outliers and to produce a more robust representative shape. 
+
+Composite curves are recomputed after assignment to reflect the current membership of each composite.
 
 ---
 
@@ -254,7 +256,7 @@ Median aggregation is used instead of a mean to reduce sensitivity to outliers a
 
 ### 1.6 Assignment & Rejection Logic
 
-Each catalogue entry is evaluated against **each composite** and produces exactly one `AssignmentRecord`.
+Each catalogue entry is evaluated against **each composite** and produces exactly one `BEQFilterMapping`.
 
 #### Possible Outcomes
 
