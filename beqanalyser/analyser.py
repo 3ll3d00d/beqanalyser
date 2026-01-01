@@ -1,5 +1,6 @@
 import copy
 import logging
+import time
 from typing import Any
 
 import hdbscan
@@ -25,15 +26,20 @@ logger = logging.getLogger(__name__)
 # ------------------------------
 def compute_beq_distance_matrix(
     X: np.ndarray,
-    chunk_size: int = 1000,
-    rms_weight: float = 0.8,
-    cosine_weight: float = 0.2,
+    chunk_size: int = 5000,
+    rms_weight: float = 0.9,
+    cosine_weight: float = 0.1,
     cosine_scale: float = 10.0,
+    rms_limit: float | None = None,
+    cosine_limit: float | None = None,
+    max_limit: float | None = None,
+    penalty_scale: float = 100.0,
 ) -> np.ndarray:
     """
     Precompute pairwise distance matrix combining RMS and cosine distance.
 
     Uses chunked computation to avoid memory explosion from broadcasting.
+    Optionally applies heavy penalties to distances that violate acceptance criteria.
 
     Args:
         X: Input data matrix (n_samples, n_features)
@@ -41,6 +47,10 @@ def compute_beq_distance_matrix(
         rms_weight: Weight for RMS component (default: 0.5)
         cosine_weight: Weight for cosine component (default: 0.5)
         cosine_scale: Scaling factor for cosine distance to match RMS range (default: 10.0)
+        rms_limit: If set, heavily penalize pairs with RMS > this limit
+        cosine_limit: If set, heavily penalize pairs with cosine similarity < this limit
+        max_limit: If set, heavily penalize pairs with max absolute deviation > this limit
+        penalty_scale: How much to increase distance for violating pairs (default: 100.0)
 
     Returns:
         Distance matrix (n_samples, n_samples) - symmetric with zeros on diagonal
@@ -53,8 +63,18 @@ def compute_beq_distance_matrix(
         f"Distance weights: RMS={rms_weight}, Cosine={cosine_weight} (scale={cosine_scale})"
     )
 
+    if rms_limit or cosine_limit or max_limit:
+        logger.info(
+            f"Applying penalties for: RMS>{rms_limit}, Cosine<{cosine_limit}, Max>{max_limit} "
+            f"(penalty_scale={penalty_scale})"
+        )
+
     # Preallocate distance matrix as float64 (required by HDBSCAN)
     distance_matrix = np.zeros((n_samples, n_samples), dtype=np.float64)
+
+    # Track violations if penalties are enabled
+    if rms_limit or cosine_limit or max_limit:
+        penalty_matrix = np.zeros((n_samples, n_samples), dtype=np.float64)
 
     # Precompute normalized vectors for cosine distance (use float32 for intermediate computation)
     norms = np.linalg.norm(X, axis=1, keepdims=True)
@@ -63,7 +83,9 @@ def compute_beq_distance_matrix(
 
     # Compute cosine similarity matrix in chunks
     logger.info("Computing cosine distances...")
+    a = time.time()
     for i in range(0, n_samples, chunk_size):
+        a1 = time.time()
         end_i = min(i + chunk_size, n_samples)
         chunk_i = X_normalized[i:end_i]
 
@@ -77,14 +99,24 @@ def compute_beq_distance_matrix(
             np.float64
         )
 
-        if (i // chunk_size) % 5 == 0:
-            logger.info(f"  Processed {end_i}/{n_samples} rows for cosine distance")
+        # Check cosine limit violations
+        if cosine_limit is not None:
+            violations = cos_sim < cosine_limit
+            penalty_matrix[i:end_i, :] += violations.astype(np.float64)
+
+        logger.info(
+            f"  Processed {end_i}/{n_samples} rows for cosine distance in {time.time() - a1:.2f}s"
+        )
+    logger.info(f"Cosine distance computation completed in {time.time() - a:.2f}s")
 
     # Compute RMS distance matrix in chunks and add to distance matrix
     logger.info("Computing RMS distances...")
+    a = time.time()
     X_float32 = X.astype(np.float32)
 
+    # Computes RMS distances in chunks; applies limit violations
     for i in range(0, n_samples, chunk_size):
+        a1 = time.time()
         end_i = min(i + chunk_size, n_samples)
         chunk_i = X_float32[i:end_i]
 
@@ -92,17 +124,43 @@ def compute_beq_distance_matrix(
             end_j = min(j + chunk_size, n_samples)
             chunk_j = X_float32[j:end_j]
 
-            # Compute RMS for this block: sqrt(mean((xi - xj)^2))
+            # Compute differences for this block
             diff = chunk_i[:, None, :] - chunk_j[None, :, :]
+
+            # Compute RMS: sqrt(mean((xi - xj)^2))
             rms_dist = np.sqrt(np.mean(diff**2, axis=2))
 
-            # Add to existing distance matrix (weighted), converting to float64
+            # Add to the existing distance matrix (weighted), converting to float64
             distance_matrix[i:end_i, j:end_j] += (rms_weight * rms_dist).astype(
                 np.float64
             )
 
-        if (i // chunk_size) % 5 == 0:
-            logger.info(f"  Processed {end_i}/{n_samples} rows for RMS distance")
+            # Check RMS limit violations
+            if rms_limit is not None:
+                violations = rms_dist > rms_limit
+                penalty_matrix[i:end_i, j:end_j] += violations.astype(np.float64)
+
+            # Check max absolute deviation violations
+            if max_limit is not None:
+                max_abs_diff = np.max(np.abs(diff), axis=2)
+                violations = max_abs_diff > max_limit
+                penalty_matrix[i:end_i, j:end_j] += violations.astype(np.float64)
+
+        logger.info(
+            f"  Processed {end_i}/{n_samples} rows for RMS distance in {time.time() - a1:.2f}s"
+        )
+    logger.info(f"RMS distance computation completed in {time.time() - a:.2f}s")
+
+    # Apply penalties for violations
+    if rms_limit or cosine_limit or max_limit:
+        n_violations = np.sum(penalty_matrix > 0)
+        pct_violations = 100.0 * n_violations / (n_samples * n_samples)
+        logger.info(
+            f"Found {n_violations:,} violating pairs ({pct_violations:.2f}% of total)"
+        )
+
+        # Add heavy penalty to violating pairs
+        distance_matrix += penalty_matrix * penalty_scale
 
     logger.info(
         f"Distance matrix computed. Range: [{distance_matrix.min():.3f}, {distance_matrix.max():.3f}]"
@@ -119,9 +177,13 @@ def hdbscan_clustering(
     min_samples: int = 50,
     cluster_selection_epsilon: float = 0.0,
     distance_chunk_size: int = 1000,
-    distance_rms_weight: float = 0.8,
-    distance_cosine_weight: float = 0.2,
+    distance_rms_weight: float = 0.5,
+    distance_cosine_weight: float = 0.5,
     distance_cosine_scale: float = 10.0,
+    distance_rms_limit: float | None = None,
+    distance_cosine_limit: float | None = None,
+    distance_max_limit: float | None = None,
+    distance_penalty_scale: float = 100.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Use HDBSCAN to identify natural cluster structure directly.
@@ -135,6 +197,10 @@ def hdbscan_clustering(
         distance_rms_weight: Weight for RMS component in distance metric (default: 0.5)
         distance_cosine_weight: Weight for cosine component in distance metric (default: 0.5)
         distance_cosine_scale: Scaling factor for cosine distance (default: 10.0)
+        distance_rms_limit: If set, penalize pairs with RMS > limit
+        distance_cosine_limit: If set, penalize pairs with cosine similarity < limit
+        distance_max_limit: If set, penalize pairs with max absolute deviation > limit
+        distance_penalty_scale: Penalty multiplier for violating pairs (default: 100.0)
 
     Returns:
         Tuple of (cluster_labels, cluster_medoids)
@@ -148,6 +214,10 @@ def hdbscan_clustering(
         rms_weight=distance_rms_weight,
         cosine_weight=distance_cosine_weight,
         cosine_scale=distance_cosine_scale,
+        rms_limit=distance_rms_limit,
+        cosine_limit=distance_cosine_limit,
+        max_limit=distance_max_limit,
+        penalty_scale=distance_penalty_scale,
     )
 
     # Run HDBSCAN clustering with precomputed distances
@@ -165,6 +235,12 @@ def hdbscan_clustering(
     # Get unique cluster labels (excluding noise labeled as -1)
     unique_labels = np.unique(labels[labels != -1])
     n_clusters = len(unique_labels)
+    n_noise = np.sum(labels == -1)
+
+    if n_noise > 0:
+        logger.info(
+            f"HDBSCAN identified {n_noise} noise points ({100.0 * n_noise / X.shape[0]:.1f}%)"
+        )
 
     if n_clusters == 0:
         # If HDBSCAN found no clusters (all noise), create a single cluster
@@ -187,19 +263,9 @@ def hdbscan_clustering(
         medoid_idx = np.argmin(distances)
         cluster_medoids.append(cluster_points[medoid_idx])
 
-    # Handle noise points: assign to nearest cluster
-    noise_mask = labels == -1
-    if np.any(noise_mask):
-        noise_points = X[noise_mask]
-        medoid_array = np.array(cluster_medoids)
-
-        # For each noise point, find nearest cluster medoid
-        for i, noise_point in enumerate(noise_points):
-            distances = np.linalg.norm(medoid_array - noise_point, axis=1)
-            nearest_cluster = unique_labels[np.argmin(distances)]
-            # Find the actual index in the original array
-            noise_indices = np.where(noise_mask)[0]
-            labels[noise_indices[i]] = nearest_cluster
+    # Keep noise points as noise (label=-1) - they will be handled during the assignment phase
+    # The iterative refinement will attempt to assign them, and they'll be rejected if they
+    # don't meet the acceptance criteria
 
     return labels, np.array(cluster_medoids)
 
@@ -259,11 +325,13 @@ def map_to_best_composite(
     candidates = [m for m in mappings if m.rms_delta <= min_rms + rms_epsilon]
 
     # Among candidates, select the candidate with the highest cosine similarity
-    best_metrics = max(candidates, key=lambda m: m.cosine_similarity)
+    best_metrics = (
+        max(candidates, key=lambda m: m.cosine_similarity) if candidates else None
+    )
 
     # flag all other composites as suboptimal unless already rejected
     for mapping in mappings:
-        if mapping.composite_id != best_metrics.composite_id:
+        if best_metrics and mapping.composite_id != best_metrics.composite_id:
             if not mapping.rejected:
                 mapping.rejection_reason = RejectionReason.SUBOPTIMAL
         else:
@@ -329,6 +397,9 @@ def compute_fan_curves(
 # ------------------------------
 # Full pipeline
 # ------------------------------
+# ------------------------------
+# Full pipeline
+# ------------------------------
 def build_beq_composites(
     responses_db: np.ndarray,
     freqs: np.ndarray,
@@ -346,9 +417,11 @@ def build_beq_composites(
     hdbscan_min_samples: int = 50,
     hdbscan_cluster_selection_epsilon: float = 0.0,
     hdbscan_distance_chunk_size: int = 1000,
-    hdbscan_distance_rms_weight: float = 0.9,
-    hdbscan_distance_cosine_weight: float = 0.1,
+    hdbscan_distance_rms_weight: float = 0.5,
+    hdbscan_distance_cosine_weight: float = 0.5,
     hdbscan_distance_cosine_scale: float = 10.0,
+    hdbscan_use_constraints: bool = True,
+    hdbscan_distance_penalty_scale: float = 100.0,
 ) -> BEQCompositeComputation:
     """
     Build BEQ composite filters using HDBSCAN clustering.
@@ -373,6 +446,8 @@ def build_beq_composites(
         hdbscan_distance_rms_weight: Weight for RMS component in distance (default: 0.5)
         hdbscan_distance_cosine_weight: Weight for cosine component in distance (default: 0.5)
         hdbscan_distance_cosine_scale: Scaling factor for cosine to match RMS range (default: 10.0)
+        hdbscan_use_constraints: If True, penalize pairs that violate acceptance criteria (default: True)
+        hdbscan_distance_penalty_scale: Penalty multiplier for constraint violations (default: 100.0)
 
     Returns:
         BEQCompositeComputation with all cycles and final composites
@@ -389,7 +464,7 @@ def build_beq_composites(
         weights[band_mask] if weights is not None else None
     )
 
-    # Step 1: HDBSCAN clustering
+    # Step 1: HDBSCAN clustering (replaces k-medoids + Ward)
     labels, cluster_medoids = hdbscan_clustering(
         catalogue,
         min_cluster_size=hdbscan_min_cluster_size,
@@ -399,6 +474,10 @@ def build_beq_composites(
         distance_rms_weight=hdbscan_distance_rms_weight,
         distance_cosine_weight=hdbscan_distance_cosine_weight,
         distance_cosine_scale=hdbscan_distance_cosine_scale,
+        distance_rms_limit=rms_limit if hdbscan_use_constraints else None,
+        distance_cosine_limit=cosine_limit if hdbscan_use_constraints else None,
+        distance_max_limit=max_limit if hdbscan_use_constraints else None,
+        distance_penalty_scale=hdbscan_distance_penalty_scale,
     )
 
     n_clusters = len(cluster_medoids)
@@ -415,7 +494,15 @@ def build_beq_composites(
 
     iterations: list[ComputationCycle] = [ComputationCycle(0, composites)]
 
-    # iterate until rejection rate stops improving
+    # Log initial cluster statistics
+    n_noise = np.sum(labels == -1)
+    if n_noise > 0:
+        logger.info(
+            f"Initial clusters: {n_clusters} composites cover {catalogue.shape[0] - n_noise} curves "
+            f"({n_noise} noise points will be assigned during iteration)"
+        )
+
+    # iterate until the rejection rate stops improving
     prev_reject_rate: float | None = None
     for attempt in range(max_iterations):
         # Step 3: assign all entries

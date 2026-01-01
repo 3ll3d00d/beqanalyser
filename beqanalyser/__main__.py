@@ -10,7 +10,7 @@ from beqanalyser.analyser import build_beq_composites
 from beqanalyser.loader import load
 from beqanalyser.reporter import (
     plot_assigned_fan_curves,
-    plot_composite_iterations,
+    plot_composite_evolution,
     plot_histograms,
     plot_rejected_by_reason,
     plot_rms_max_scatter,
@@ -30,6 +30,7 @@ if __name__ == "__main__":
     max_limit = 10.0
     cosine_limit = 0.9
     derivative_limit = 0.9
+    use_constraints = True
 
     catalogue: list[BEQFilter] = load()
     by_author_by_year = defaultdict(lambda: defaultdict(int))
@@ -48,9 +49,10 @@ if __name__ == "__main__":
         cosine_limit=cosine_limit,
         derivative_limit=derivative_limit,
         fan_counts=fan_counts,
-        hdbscan_min_cluster_size=3,
-        hdbscan_min_samples=3,
-        hdbscan_cluster_selection_epsilon=2.0,
+        hdbscan_min_cluster_size=8,
+        hdbscan_min_samples=None,
+        hdbscan_cluster_selection_epsilon=0.5,
+        hdbscan_use_constraints=use_constraints,
     )
 
     reject_only_calc = build_beq_composites(
@@ -63,21 +65,38 @@ if __name__ == "__main__":
         cosine_limit=cosine_limit,
         derivative_limit=derivative_limit,
         fan_counts=fan_counts,
-        hdbscan_min_cluster_size=2,
-        hdbscan_min_samples=5,
-        hdbscan_cluster_selection_epsilon=3.0,
+        hdbscan_min_cluster_size=8,
+        hdbscan_min_samples=None,
+        hdbscan_cluster_selection_epsilon=1.0,
+        hdbscan_use_constraints=use_constraints,
+    )
+
+    reject_only_calc_2 = build_beq_composites(
+        responses_db=responses_db[reject_only_calc.result.rejected_entry_ids],
+        freqs=freqs,
+        weights=weights,
+        band=(min_freq, max_freq),
+        rms_limit=rms_limit,
+        max_limit=max_limit,
+        cosine_limit=cosine_limit,
+        derivative_limit=derivative_limit,
+        fan_counts=fan_counts,
+        hdbscan_min_cluster_size=5,
+        hdbscan_min_samples=None,
+        hdbscan_cluster_selection_epsilon=2.0,
+        hdbscan_use_constraints=use_constraints,
     )
 
     def dump_diagnostics(calculation: BEQCompositeComputation, is_all: bool = False):
         summarize_assignments(calculation)
-        plot_composite_iterations(calculation, freqs, band=(min_freq, max_freq))
         if is_all:
             plot_histograms(calculation.result)
+            plot_rms_max_scatter(calculation)
+        plot_composite_evolution(calculation, freqs, band=(min_freq, max_freq))
         plot_assigned_fan_curves(
             calculation, freqs[(freqs >= min_freq) & (freqs <= max_freq)]
         )
         if is_all:
-            plot_rms_max_scatter(calculation)
             print_assignments(calculation, catalogue)
         else:
             plot_rejected_by_reason(
@@ -86,5 +105,6 @@ if __name__ == "__main__":
                 freqs[(freqs >= min_freq) & (freqs <= max_freq)],
             )
 
-    dump_diagnostics(all_calc, is_all=True)
+    dump_diagnostics(all_calc, is_all=False)
     dump_diagnostics(reject_only_calc, is_all=False)
+    dump_diagnostics(reject_only_calc_2, is_all=False)

@@ -39,7 +39,7 @@ def summarize_assignments(computation: BEQCompositeComputation) -> None:
         )
 
 
-def plot_composite_iterations(
+def plot_composite_evolution(
     computation: BEQCompositeComputation,
     freqs: np.ndarray,
     band: tuple[float, float] = (5, 50),
@@ -178,6 +178,12 @@ def plot_assigned_fan_curves(
             ax.set_ylabel("Magnitude (dB)")
         if comp.id >= ncols * (nrows - 1):
             ax.set_xlabel("Frequency (Hz)")
+
+        ax.grid(True, which='both', alpha=0.3)
+        ax.set_xscale("log")
+        ax.xaxis.set_major_formatter(StrMethodFormatter('{x:.0f}'))
+        ax.xaxis.set_minor_formatter(StrMethodFormatter('{x:.0f}'))
+        ax.xaxis.set_tick_params(which='both', labelsize=6)
 
         # Inset histogram for RMS of assigned curves
         inset = ax.inset_axes([0.65, 0.65, 0.32, 0.32])
