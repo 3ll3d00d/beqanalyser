@@ -1,22 +1,24 @@
+import datetime
 import logging
 import sys
-from http.client import responses
-from itertools import groupby
+from collections import defaultdict
 
 import numpy as np
 
-from beqanalyser import BEQFilter, BEQCompositeComputation
+from beqanalyser import BEQCompositeComputation, BEQFilter
 from beqanalyser.analyser import build_beq_composites
 from beqanalyser.loader import load
 from beqanalyser.reporter import (
-    plot_all_beq_curves,
+    plot_assigned_fan_curves,
+    plot_composite_iterations,
     plot_histograms,
+    plot_rejected_by_reason,
     plot_rms_max_scatter,
     print_assignments,
     summarize_assignments,
 )
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     rootLogger = logging.getLogger()
     rootLogger.addHandler(logging.StreamHandler(sys.stdout))
     rootLogger.setLevel(logging.INFO)
@@ -26,57 +28,63 @@ if __name__ == '__main__':
     fan_counts = (5, 10, 20, 50, 100)
     rms_limit = 10.0
     max_limit = 10.0
-    cosine_limit = 0.975
-    derivative_limit = 1.0
+    cosine_limit = 0.9
+    derivative_limit = 0.9
 
     catalogue: list[BEQFilter] = load()
+    by_author_by_year = defaultdict(lambda: defaultdict(int))
 
-    by_author = groupby(catalogue, lambda x: x.entry.author)
-    for author, filters_iter in by_author:
-        filters = list(filters_iter)
-        freqs = filters[0].mag_freqs
-        if author != 'aron7awol':
-            continue
-        responses_db = np.array([f.mag_db - f.mag_db[-1] for f in filters])
-        weights = np.ones_like(freqs)
+    freqs = catalogue[0].mag_freqs
+    responses_db = np.array([f.mag_db - f.mag_db[-1] for f in catalogue])
+    weights = np.ones_like(freqs)
 
-        all_calc = build_beq_composites(
-            responses_db=responses_db,
-            freqs=freqs,
-            weights=weights,
-            band=(min_freq, max_freq),
-            k=6,
-            rms_limit=rms_limit,
-            max_limit=max_limit,
-            cosine_limit=cosine_limit,
-            derivative_limit=derivative_limit,
-            fan_counts=fan_counts,
-            n_prototypes=1024
+    all_calc = build_beq_composites(
+        responses_db=responses_db,
+        freqs=freqs,
+        weights=weights,
+        band=(min_freq, max_freq),
+        rms_limit=rms_limit,
+        max_limit=max_limit,
+        cosine_limit=cosine_limit,
+        derivative_limit=derivative_limit,
+        fan_counts=fan_counts,
+        hdbscan_min_cluster_size=3,
+        hdbscan_min_samples=3,
+        hdbscan_cluster_selection_epsilon=2.0,
+    )
+
+    reject_only_calc = build_beq_composites(
+        responses_db=responses_db[all_calc.result.rejected_entry_ids],
+        freqs=freqs,
+        weights=weights,
+        band=(min_freq, max_freq),
+        rms_limit=rms_limit,
+        max_limit=max_limit,
+        cosine_limit=cosine_limit,
+        derivative_limit=derivative_limit,
+        fan_counts=fan_counts,
+        hdbscan_min_cluster_size=2,
+        hdbscan_min_samples=5,
+        hdbscan_cluster_selection_epsilon=3.0,
+    )
+
+    def dump_diagnostics(calculation: BEQCompositeComputation, is_all: bool = False):
+        summarize_assignments(calculation)
+        plot_composite_iterations(calculation, freqs, band=(min_freq, max_freq))
+        if is_all:
+            plot_histograms(calculation.result)
+        plot_assigned_fan_curves(
+            calculation, freqs[(freqs >= min_freq) & (freqs <= max_freq)]
         )
+        if is_all:
+            plot_rms_max_scatter(calculation)
+            print_assignments(calculation, catalogue)
+        else:
+            plot_rejected_by_reason(
+                responses_db[:, (freqs >= min_freq) & (freqs <= max_freq)],
+                calculation,
+                freqs[(freqs >= min_freq) & (freqs <= max_freq)],
+            )
 
-        reject_only_calc = build_beq_composites(
-            responses_db=responses_db[all_calc.result.rejected_entry_ids],
-            freqs=freqs,
-            weights=weights,
-            band=(min_freq, max_freq),
-            k=6,
-            rms_limit=rms_limit,
-            max_limit=max_limit,
-            cosine_limit=cosine_limit,
-            derivative_limit=derivative_limit,
-            fan_counts=fan_counts,
-            n_prototypes=1024
-        )
-
-        def dump_diagnostics(calculation: BEQCompositeComputation, do_all: bool = False):
-            summarize_assignments(calculation)
-            if do_all:
-                plot_histograms(calculation.result)
-            plot_all_beq_curves(responses_db[:, (freqs >= min_freq) & (freqs <= max_freq)],
-                                calculation, freqs[(freqs >= min_freq) & (freqs <= max_freq)])
-            if do_all:
-                plot_rms_max_scatter(calculation)
-                print_assignments(calculation, filters)
-
-        dump_diagnostics(all_calc, do_all=True)
-        dump_diagnostics(reject_only_calc, do_all=False)
+    dump_diagnostics(all_calc, is_all=True)
+    dump_diagnostics(reject_only_calc, is_all=False)

@@ -1,11 +1,11 @@
 import logging
 
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+from matplotlib.ticker import FormatStrFormatter, StrMethodFormatter
 from scipy.stats import gaussian_kde
-
 
 from beqanalyser import (
     BEQCompositeComputation,
@@ -38,6 +38,110 @@ def summarize_assignments(computation: BEQCompositeComputation) -> None:
             f"  Iteration {i + 1}: {cycle.reject_rate(computation.input_count):.2%}"
         )
 
+
+def plot_composite_iterations(
+    computation: BEQCompositeComputation,
+    freqs: np.ndarray,
+    band: tuple[float, float] = (5, 50),
+    figsize: tuple[int, int] | None = None,
+    save_path: str | None = None,
+) -> None:
+    """
+    Plot the evolution of each composite across iterations.
+
+    Each composite gets its own subplot showing how its magnitude response
+    evolved through the iterative refinement process.
+
+    Args:
+        computation: BEQCompositeComputation result from build_beq_composites
+        freqs: Full frequency array
+        band: Frequency band to display (min_freq, max_freq)
+        figsize: Figure size as (width, height). If None, auto-calculated
+        save_path: Optional path to save the figure. If None, displays interactively
+    """
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.gridspec import GridSpec
+    except ImportError:
+        logger.error(
+            "matplotlib is required for plotting. Install with: pip install matplotlib"
+        )
+        return
+
+    # Extract band frequencies
+    band_mask = (freqs >= band[0]) & (freqs <= band[1])
+    band_freqs = freqs[band_mask]
+
+    # Get number of composites
+    n_composites = len(computation.cycles[0].composites)
+
+    # Calculate grid dimensions (try to make it roughly square)
+    n_cols = int(np.ceil(np.sqrt(n_composites)))
+    n_rows = int(np.ceil(n_composites / n_cols))
+
+    # Auto-calculate figure size if not provided
+    if figsize is None:
+        figsize = (n_cols * 5, n_rows * 4)
+
+    # Create figure and subplots
+    fig = plt.figure(figsize=figsize)
+    gs = GridSpec(n_rows, n_cols, figure=fig, hspace=0.3, wspace=0.3)
+
+    # Color map for iterations
+    n_iterations = len(computation.cycles)
+    colors = plt.cm.viridis(np.linspace(0, 1, n_iterations))
+
+    # Plot each composite
+    for comp_id in range(n_composites):
+        row = comp_id // n_cols
+        col = comp_id % n_cols
+        ax = fig.add_subplot(gs[row, col])
+
+        # Plot each iteration for this composite
+        for cycle_idx, cycle in enumerate(computation.cycles):
+            composite = cycle.composites[comp_id]
+
+            # Plot the composite curve
+            ax.plot(
+                band_freqs,
+                composite.mag_response,
+                color=colors[cycle_idx],
+                linewidth=2 if cycle_idx == n_iterations - 1 else 1,
+                alpha=0.8 if cycle_idx == n_iterations - 1 else 0.5,
+                label=f"Iter {cycle.iteration}",
+            )
+
+        # Get the final assignment count
+        final_composite = computation.cycles[-1].composites[comp_id]
+        n_assigned = len(final_composite.assigned_entry_ids)
+
+        # Formatting
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel("Magnitude (dB)")
+        ax.set_title(f"Composite {comp_id + 1} ({n_assigned})")
+        ax.grid(True, which='both', alpha=0.3)
+        ax.set_xscale("log")
+        ax.xaxis.set_major_formatter(StrMethodFormatter('{x:.0f}'))
+        ax.xaxis.set_minor_formatter(StrMethodFormatter('{x:.0f}'))
+        ax.xaxis.set_tick_params(which='both', labelsize=6)
+
+        # Add legend only to the first subplot
+        if comp_id == 0:
+            ax.legend(loc="best", fontsize=8, framealpha=0.9)
+
+    # Overall title
+    fig.suptitle("Composite Evolution", y=0.98)
+
+    # Save or show
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        logger.info(f"Plot saved to {save_path}")
+    else:
+        plt.show()
+
+    plt.close(fig)
+
+
 def plot_assigned_fan_curves(
     computation: BEQCompositeComputation, freqs: np.ndarray
 ) -> None:
@@ -66,7 +170,9 @@ def plot_assigned_fan_curves(
             freqs, comp.mag_response, color="black", lw=2, label="Composite", zorder=3
         )
 
-        ax.set_title(f"Composite {comp.id + 1} ({len(comp.assigned_entry_ids)} assigned)")
+        ax.set_title(
+            f"Composite {comp.id + 1} ({len(comp.assigned_entry_ids)} assigned)"
+        )
         ax.grid(True, alpha=0.3)
         if comp.id % ncols == 0:
             ax.set_ylabel("Magnitude (dB)")
@@ -75,7 +181,9 @@ def plot_assigned_fan_curves(
 
         # Inset histogram for RMS of assigned curves
         inset = ax.inset_axes([0.65, 0.65, 0.32, 0.32])
-        assigned_rms = np.array([m.rms_delta for m in comp.mappings])
+        assigned_rms = np.array(
+            [m.rms_delta for m in comp.mappings if m.is_best and not m.rejected]
+        )
         if len(assigned_rms) > 0:
             inset.hist(assigned_rms, bins=15, color="lightblue", alpha=0.7)
         inset.set_title("Assigned RMS", fontsize=8)
@@ -180,23 +288,25 @@ def plot_rejected_by_reason(
     plt.show()
 
 
-def plot_all_beq_curves(
-    catalogue: np.ndarray, computation: BEQCompositeComputation, freqs: np.ndarray
-) -> None:
-    """Convenience function to plot assigned and rejected curves."""
-    plot_assigned_fan_curves(computation, freqs)
-    plot_rejected_by_reason(catalogue, computation, freqs)
-
-
 # ------------------------------
 # RMS vs Max scatter with density
 # ------------------------------
 def plot_rms_max_scatter(computation: BEQCompositeComputation) -> None:
     all_rms: np.ndarray = np.array(
-        [m.rms_delta for c in computation.result.composites for m in c.mappings if m.is_best]
+        [
+            m.rms_delta
+            for c in computation.result.composites
+            for m in c.mappings
+            if m.is_best
+        ]
     )
     all_max: np.ndarray = np.array(
-        [m.max_delta for c in computation.result.composites for m in c.mappings if m.is_best]
+        [
+            m.max_delta
+            for c in computation.result.composites
+            for m in c.mappings
+            if m.is_best
+        ]
     )
 
     xy: np.ndarray = np.vstack([all_rms, all_max])
@@ -280,6 +390,7 @@ def plot_histograms(result: ComputationCycle) -> None:
     axes[i].set_xlabel("Cosine")
     axes[i].set_ylabel("Count")
     axes[i].set_title("Cosine Similarity")
+    axes[i].set_xlim(0.5, 1)
     add_percentile_lines(axes[i], cosine_vals)
 
     # Cosine similarity histogram
@@ -288,6 +399,7 @@ def plot_histograms(result: ComputationCycle) -> None:
     axes[i].set_xlabel("Derivative Delta")
     axes[i].set_ylabel("Count")
     axes[i].set_title("Derivative Delta")
+    axes[i].set_xlim(0.5, 1)
     add_percentile_lines(axes[i], derivative_deltas)
 
     plt.tight_layout()
@@ -319,20 +431,21 @@ def print_assignments(
         )
         for c in computation.result.composites:
             for m in c.mappings:
-                underlying: BEQFilter = filters[m.entry_id]
-                writer.writerow(
-                    [
-                        m.composite_id,
-                        m.rejection_reason.name if m.rejection_reason else "",
-                        underlying.entry.content_type,
-                        underlying.entry.author,
-                        underlying.entry.formatted_title,
-                        underlying.entry.year,
-                        m.cosine_similarity,
-                        m.rms_delta,
-                        m.max_delta,
-                        m.derivative_delta,
-                        underlying.entry.digest,
-                        underlying.entry.beqc_url,
-                    ]
-                )
+                if m.is_best:
+                    underlying: BEQFilter = filters[m.entry_id]
+                    writer.writerow(
+                        [
+                            m.composite_id,
+                            m.rejection_reason.name if m.rejection_reason else "",
+                            underlying.entry.content_type,
+                            underlying.entry.author,
+                            underlying.entry.formatted_title,
+                            underlying.entry.year,
+                            m.cosine_similarity,
+                            m.rms_delta,
+                            m.max_delta,
+                            m.derivative_delta,
+                            underlying.entry.digest,
+                            underlying.entry.beqc_url,
+                        ]
+                    )

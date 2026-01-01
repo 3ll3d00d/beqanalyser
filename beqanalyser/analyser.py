@@ -1,10 +1,10 @@
 import copy
-import math
+import logging
 from typing import Any
 
+import hdbscan
 import numpy as np
 from numpy import dtype, ndarray
-from scipy.cluster.hierarchy import fcluster, linkage
 
 from beqanalyser import (
     BEQComposite,
@@ -17,40 +17,191 @@ from beqanalyser import (
     rms,
 )
 
+logger = logging.getLogger(__name__)
+
 
 # ------------------------------
-# Pure NumPy K-medoids
+# Precompute distance matrix for BEQ curves
 # ------------------------------
-def k_medoids(
-    X: np.ndarray, n_clusters: int, max_iter: int = 100, random_state: int = 0
+def compute_beq_distance_matrix(
+    X: np.ndarray,
+    chunk_size: int = 1000,
+    rms_weight: float = 0.8,
+    cosine_weight: float = 0.2,
+    cosine_scale: float = 10.0,
 ) -> np.ndarray:
-    rng = np.random.default_rng(seed=random_state)
+    """
+    Precompute pairwise distance matrix combining RMS and cosine distance.
+
+    Uses chunked computation to avoid memory explosion from broadcasting.
+
+    Args:
+        X: Input data matrix (n_samples, n_features)
+        chunk_size: Number of rows to process at once (adjust based on available memory)
+        rms_weight: Weight for RMS component (default: 0.5)
+        cosine_weight: Weight for cosine component (default: 0.5)
+        cosine_scale: Scaling factor for cosine distance to match RMS range (default: 10.0)
+
+    Returns:
+        Distance matrix (n_samples, n_samples) - symmetric with zeros on diagonal
+    """
     n_samples = X.shape[0]
-    medoid_indices = rng.choice(n_samples, size=n_clusters, replace=False)
+    logger.info(
+        f"Computing distance matrix for {n_samples} samples in chunks of {chunk_size}..."
+    )
+    logger.info(
+        f"Distance weights: RMS={rms_weight}, Cosine={cosine_weight} (scale={cosine_scale})"
+    )
 
-    for _ in range(max_iter):
-        dists = np.linalg.norm(X[:, None, :] - X[medoid_indices][None, :, :], axis=2)
-        labels = np.argmin(dists, axis=1)
+    # Preallocate distance matrix as float64 (required by HDBSCAN)
+    distance_matrix = np.zeros((n_samples, n_samples), dtype=np.float64)
 
-        new_medoids = np.copy(medoid_indices)
-        for i in range(n_clusters):
-            cluster_points = X[labels == i]
-            if len(cluster_points) == 0:
-                continue
-            total_dists = np.sum(
-                np.linalg.norm(
-                    cluster_points[:, None, :] - cluster_points[None, :, :], axis=2
-                ),
-                axis=1,
+    # Precompute normalized vectors for cosine distance (use float32 for intermediate computation)
+    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    X_normalized = (X / norms).astype(np.float32)
+
+    # Compute cosine similarity matrix in chunks
+    logger.info("Computing cosine distances...")
+    for i in range(0, n_samples, chunk_size):
+        end_i = min(i + chunk_size, n_samples)
+        chunk_i = X_normalized[i:end_i]
+
+        # Compute cosine similarity for this chunk against all samples
+        cos_sim = np.dot(chunk_i, X_normalized.T)
+        cos_sim = np.clip(cos_sim, -1.0, 1.0)
+        cos_dist = 1.0 - cos_sim
+
+        # Store in distance matrix (scaled and weighted), converting to float64
+        distance_matrix[i:end_i, :] = (cosine_weight * cos_dist * cosine_scale).astype(
+            np.float64
+        )
+
+        if (i // chunk_size) % 5 == 0:
+            logger.info(f"  Processed {end_i}/{n_samples} rows for cosine distance")
+
+    # Compute RMS distance matrix in chunks and add to distance matrix
+    logger.info("Computing RMS distances...")
+    X_float32 = X.astype(np.float32)
+
+    for i in range(0, n_samples, chunk_size):
+        end_i = min(i + chunk_size, n_samples)
+        chunk_i = X_float32[i:end_i]
+
+        for j in range(0, n_samples, chunk_size):
+            end_j = min(j + chunk_size, n_samples)
+            chunk_j = X_float32[j:end_j]
+
+            # Compute RMS for this block: sqrt(mean((xi - xj)^2))
+            diff = chunk_i[:, None, :] - chunk_j[None, :, :]
+            rms_dist = np.sqrt(np.mean(diff**2, axis=2))
+
+            # Add to existing distance matrix (weighted), converting to float64
+            distance_matrix[i:end_i, j:end_j] += (rms_weight * rms_dist).astype(
+                np.float64
             )
-            min_idx = np.argmin(total_dists)
-            new_medoids[i] = np.where((X == cluster_points[min_idx]).all(axis=1))[0][0]
 
-        if np.all(new_medoids == medoid_indices):
-            break
-        medoid_indices = new_medoids
+        if (i // chunk_size) % 5 == 0:
+            logger.info(f"  Processed {end_i}/{n_samples} rows for RMS distance")
 
-    return medoid_indices
+    logger.info(
+        f"Distance matrix computed. Range: [{distance_matrix.min():.3f}, {distance_matrix.max():.3f}]"
+    )
+    return distance_matrix
+
+
+# ------------------------------
+# HDBSCAN clustering
+# ------------------------------
+def hdbscan_clustering(
+    X: np.ndarray,
+    min_cluster_size: int = 500,
+    min_samples: int = 50,
+    cluster_selection_epsilon: float = 0.0,
+    distance_chunk_size: int = 1000,
+    distance_rms_weight: float = 0.8,
+    distance_cosine_weight: float = 0.2,
+    distance_cosine_scale: float = 10.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Use HDBSCAN to identify natural cluster structure directly.
+
+    Args:
+        X: Input data matrix (n_samples, n_features)
+        min_cluster_size: Minimum cluster size for HDBSCAN
+        min_samples: Minimum samples parameter for HDBSCAN
+        cluster_selection_epsilon: Distance threshold for cluster merging (0.0 = no merging)
+        distance_chunk_size: Chunk size for distance matrix computation (lower = less memory)
+        distance_rms_weight: Weight for RMS component in distance metric (default: 0.5)
+        distance_cosine_weight: Weight for cosine component in distance metric (default: 0.5)
+        distance_cosine_scale: Scaling factor for cosine distance (default: 10.0)
+
+    Returns:
+        Tuple of (cluster_labels, cluster_medoids)
+        - cluster_labels: Array of cluster assignments for each input
+        - cluster_medoids: Representative curves (medoid) for each cluster
+    """
+    # Precompute distance matrix for much faster clustering
+    distance_matrix = compute_beq_distance_matrix(
+        X,
+        chunk_size=distance_chunk_size,
+        rms_weight=distance_rms_weight,
+        cosine_weight=distance_cosine_weight,
+        cosine_scale=distance_cosine_scale,
+    )
+
+    # Run HDBSCAN clustering with precomputed distances
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        metric="precomputed",
+        cluster_selection_method="eom",  # Excess of Mass
+        cluster_selection_epsilon=cluster_selection_epsilon,
+        allow_single_cluster=False,
+    )
+
+    labels = clusterer.fit_predict(distance_matrix)
+
+    # Get unique cluster labels (excluding noise labeled as -1)
+    unique_labels = np.unique(labels[labels != -1])
+    n_clusters = len(unique_labels)
+
+    if n_clusters == 0:
+        # If HDBSCAN found no clusters (all noise), create a single cluster
+        logger.warning(
+            "HDBSCAN found no clusters. Creating single cluster from all data."
+        )
+        labels = np.zeros(X.shape[0], dtype=int)
+        unique_labels = np.array([0])
+        n_clusters = 1
+
+    # Compute medoid for each cluster (point closest to cluster median)
+    cluster_medoids = []
+    for label in unique_labels:
+        cluster_mask = labels == label
+        cluster_points = X[cluster_mask]
+
+        # Find medoid: point in cluster closest to the median
+        cluster_median = np.median(cluster_points, axis=0)
+        distances = np.linalg.norm(cluster_points - cluster_median, axis=1)
+        medoid_idx = np.argmin(distances)
+        cluster_medoids.append(cluster_points[medoid_idx])
+
+    # Handle noise points: assign to nearest cluster
+    noise_mask = labels == -1
+    if np.any(noise_mask):
+        noise_points = X[noise_mask]
+        medoid_array = np.array(cluster_medoids)
+
+        # For each noise point, find nearest cluster medoid
+        for i, noise_point in enumerate(noise_points):
+            distances = np.linalg.norm(medoid_array - noise_point, axis=1)
+            nearest_cluster = unique_labels[np.argmin(distances)]
+            # Find the actual index in the original array
+            noise_indices = np.where(noise_mask)[0]
+            labels[noise_indices[i]] = nearest_cluster
+
+    return labels, np.array(cluster_medoids)
 
 
 # ------------------------------
@@ -183,48 +334,91 @@ def build_beq_composites(
     freqs: np.ndarray,
     weights: np.ndarray | None = None,
     band: tuple[float, float] = (5, 50),
-    k: int = 5,
     rms_limit: float = 5.0,
     max_limit: float = 5.0,
     cosine_limit: float = 0.95,
     derivative_limit: float = 2.0,
     fan_counts: tuple[int, ...] = (5,),
-    n_prototypes: int = 50,
     rms_epsilon: float = 0.5,
     max_iterations: int = 10,
     min_reject_rate_delta: float = 0.005,
+    hdbscan_min_cluster_size: int = 500,
+    hdbscan_min_samples: int = 50,
+    hdbscan_cluster_selection_epsilon: float = 0.0,
+    hdbscan_distance_chunk_size: int = 1000,
+    hdbscan_distance_rms_weight: float = 0.9,
+    hdbscan_distance_cosine_weight: float = 0.1,
+    hdbscan_distance_cosine_scale: float = 10.0,
 ) -> BEQCompositeComputation:
+    """
+    Build BEQ composite filters using HDBSCAN clustering.
+
+    Args:
+        responses_db: Full frequency response database
+        freqs: Frequency array
+        weights: Optional frequency weights
+        band: Frequency band to analyze (min_freq, max_freq)
+        rms_limit: Maximum acceptable RMS deviation for assignment
+        max_limit: Maximum acceptable absolute deviation
+        cosine_limit: Minimum acceptable cosine similarity
+        derivative_limit: Maximum acceptable derivative RMS
+        fan_counts: Number of curves in each fan level
+        rms_epsilon: Tolerance for near-minimum RMS selection
+        max_iterations: Maximum refinement iterations
+        min_reject_rate_delta: Minimum change in reject rate to continue iterating
+        hdbscan_min_cluster_size: Minimum cluster size for HDBSCAN (controls number of clusters)
+        hdbscan_min_samples: Minimum samples for core points (controls cluster density)
+        hdbscan_cluster_selection_epsilon: Distance threshold for merging clusters (0.0 = no merging)
+        hdbscan_distance_chunk_size: Chunk size for distance computation (lower = less memory, default 1000)
+        hdbscan_distance_rms_weight: Weight for RMS component in distance (default: 0.5)
+        hdbscan_distance_cosine_weight: Weight for cosine component in distance (default: 0.5)
+        hdbscan_distance_cosine_scale: Scaling factor for cosine to match RMS range (default: 10.0)
+
+    Returns:
+        BEQCompositeComputation with all cycles and final composites
+
+    Note:
+        The number of final composites is determined by HDBSCAN parameters:
+        - Increase min_cluster_size to get fewer, larger clusters
+        - Increase min_samples to get more conservative, tighter clusters
+        - Increase cluster_selection_epsilon to merge similar clusters
+    """
     band_mask: np.ndarray = (freqs >= band[0]) & (freqs <= band[1])
     catalogue: np.ndarray = responses_db[:, band_mask]
     band_weights: np.ndarray | None = (
         weights[band_mask] if weights is not None else None
     )
 
-    # Step 1: k-medoids prototypes
-    if catalogue.shape[0] <= n_prototypes:
-        prototypes: np.ndarray = catalogue.copy()
-    else:
-        medoid_indices: np.ndarray = k_medoids(
-            catalogue, n_prototypes, max_iter=100, random_state=0
-        )
-        prototypes = catalogue[medoid_indices]
+    # Step 1: HDBSCAN clustering
+    labels, cluster_medoids = hdbscan_clustering(
+        catalogue,
+        min_cluster_size=hdbscan_min_cluster_size,
+        min_samples=hdbscan_min_samples,
+        cluster_selection_epsilon=hdbscan_cluster_selection_epsilon,
+        distance_chunk_size=hdbscan_distance_chunk_size,
+        distance_rms_weight=hdbscan_distance_rms_weight,
+        distance_cosine_weight=hdbscan_distance_cosine_weight,
+        distance_cosine_scale=hdbscan_distance_cosine_scale,
+    )
 
-    # Step 2: Ward clustering
-    linkage_matrix: np.ndarray = linkage(prototypes, method="ward")
-    labels: np.ndarray = fcluster(linkage_matrix, t=k, criterion="maxclust")
+    n_clusters = len(cluster_medoids)
+    logger.info(f"HDBSCAN found {n_clusters} natural clusters")
 
-    # Step 3: median per cluster → initial estimate of composite curve
-    composites: list[BEQComposite] = [
-        BEQComposite(i - 1, np.median(prototypes[labels == i], axis=0))
-        for i in range(1, k + 1)
-    ]
+    # Step 2: Create initial composites from cluster medians
+    composites: list[BEQComposite] = []
+    for cluster_id in range(n_clusters):
+        cluster_mask = labels == cluster_id
+        cluster_curves = catalogue[cluster_mask]
+        # Use median of cluster rather than medoid for initial composite
+        composite_curve = np.median(cluster_curves, axis=0)
+        composites.append(BEQComposite(cluster_id, composite_curve))
 
     iterations: list[ComputationCycle] = [ComputationCycle(0, composites)]
 
     # iterate until rejection rate stops improving
     prev_reject_rate: float | None = None
     for attempt in range(max_iterations):
-        # Step 4: assign all entries
+        # Step 3: assign all entries
         for i, entry in enumerate(catalogue):
             map_to_best_composite(
                 entry,
@@ -238,7 +432,7 @@ def build_beq_composites(
                 rms_epsilon=rms_epsilon,
             )
 
-        # Step 5: compute reject rate
+        # Step 4: compute reject rate
         reject_rate = iterations[-1].reject_rate(catalogue.shape[0])
 
         # Halts iteration when convergence or limit reached
@@ -254,15 +448,15 @@ def build_beq_composites(
             )
             break
 
-        # Step 6: recompute median composite shapes for the next iteration using assigned entries only
+        # Step 5: recompute median composite shapes for the next iteration using assigned entries only
         prev_reject_rate = reject_rate
         iterations.append(compute_next_cycle(catalogue, iterations[-1]))
 
-    # Step 7: where multiple valid mappings exist, flag all but the best as suboptimal and recompute curves
+    # Step 6: where multiple valid mappings exist, flag all but the best as suboptimal and recompute curves
     mark_suboptimal_mappings(catalogue, iterations)
     compute_next_cycle(catalogue, iterations[-1], copy_forward=True)
 
-    # Step 8: compute fans
+    # Step 7: compute fans
     compute_fan_curves(catalogue, iterations[-1].composites, fan_counts)
 
     return BEQCompositeComputation(
