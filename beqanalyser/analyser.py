@@ -82,7 +82,7 @@ def _compute_distance_chunk(args):
             deriv_row[:, j:end_j] = deriv_rms
 
     b = time.time()
-    logger.info(f"Computed chunk {i}-{end_i} in {b-a:.3f}s")
+    logger.info(f"Computed chunk {i}-{end_i} in {b - a:.3f}s")
     return i, end_i, rms_row, cos_row, max_row, deriv_row
 
 
@@ -192,7 +192,9 @@ def compute_beq_distance_matrix(
         chunk_args.append((i, end_i, X_float32, X_normalized, worker_params))
 
     # Process chunks in parallel
-    logger.info(f"Computing base distances on {n_cores} cores in {len(chunk_args)} chunks")
+    logger.info(
+        f"Computing base distances on {n_cores} cores in {len(chunk_args)} chunks for {n_samples} samples"
+    )
     a = time.time()
     if n_cores > 1:
         with Pool(processes=min(n_cores, len(chunk_args))) as pool:
@@ -200,7 +202,7 @@ def compute_beq_distance_matrix(
     else:
         results = [_compute_distance_chunk(args) for args in chunk_args]
     b = time.time()
-    logger.info(f"Computed base distances in {b-a:.3f}s")
+    logger.info(f"Computed base distances in {b - a:.3f}s")
 
     # Assemble results and compute sophisticated distance
     logger.info("Assembling distance matrix with sophisticated penalties...")
@@ -285,7 +287,7 @@ def compute_beq_distance_matrix(
         logger.info(f"  Processed {end_i}/{n_samples} rows")
 
     c = time.time()
-    logger.info(f"Computed distance final in {c-b:.3f}s")
+    logger.info(f"Computed distance final in {c - b:.3f}s")
 
     # Log penalty statistics
     if rms_limit or cosine_limit or max_limit or derivative_limit:
@@ -298,7 +300,7 @@ def compute_beq_distance_matrix(
         )
 
     logger.info(
-        f"Distance matrix computed in {c-a:.3f}s. Range: [{distance_matrix.min():.3f}, {distance_matrix.max():.3f}]"
+        f"Distance matrix computed in {c - a:.3f}s. Range: [{distance_matrix.min():.3f}, {distance_matrix.max():.3f}]"
     )
     return distance_matrix
 
@@ -310,7 +312,7 @@ def hdbscan_clustering(
     X: np.ndarray,
     min_cluster_size: int = 500,
     min_samples: int = 50,
-    cluster_selection_epsilon: float = 0.0,
+    cluster_selection_epsilon: float = 3.0,
     distance_chunk_size: int = 1000,
     distance_rms_weight: float = 0.5,
     distance_cosine_weight: float = 0.5,
@@ -381,7 +383,7 @@ def hdbscan_clustering(
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
         metric="precomputed",
-        cluster_selection_method="eom",  # Excess of Mass
+        cluster_selection_method="eom",
         cluster_selection_epsilon=cluster_selection_epsilon,
         allow_single_cluster=False,
     )
@@ -569,7 +571,7 @@ def build_beq_composites(
     hdbscan_min_cluster_size: int = 500,
     hdbscan_min_samples: int | None = 50,
     hdbscan_cluster_selection_epsilon: float = 0.0,
-    hdbscan_distance_chunk_size: int = 5000,
+    hdbscan_distance_chunk_size: int = 1000,
     hdbscan_distance_rms_weight: float = 0.8,
     hdbscan_distance_cosine_weight: float = 0.2,
     hdbscan_distance_cosine_scale: float = 10.0,
@@ -581,6 +583,7 @@ def build_beq_composites(
     hdbscan_distance_soft_limit_factor: float = 0.7,
     hdbscan_distance_soft_penalty_scale: float = 10.0,
     hdbscan_distance_n_jobs: int = -1,
+    assign_noise_points: bool = True,
 ) -> BEQCompositeComputation:
     """
     Build BEQ composite filters using HDBSCAN clustering.
@@ -613,6 +616,7 @@ def build_beq_composites(
         hdbscan_distance_soft_limit_factor: Soft limit as fraction of hard limit (default: 0.7)
         hdbscan_distance_soft_penalty_scale: Soft penalty multiplier (default: 10.0)
         hdbscan_distance_n_jobs: Number of parallel jobs for distance computation (default: -1 = all CPUs)
+        assign_noise_points: whether noise points should be considered for assignemnt
 
     Returns:
         BEQCompositeComputation with all cycles and final composites
@@ -669,12 +673,20 @@ def build_beq_composites(
     # Log initial cluster statistics
     n_noise = np.sum(labels == -1)
     if n_noise > 0:
-        logger.info(
-            f"Initial clusters: {n_clusters} composites cover {catalogue.shape[0] - n_noise} curves "
-            f"({n_noise} noise points will be assigned during iteration)"
-        )
+        if not assign_noise_points:
+            old_cat_size = catalogue.shape[0]
+            catalogue = catalogue[labels != -1]
+            logger.info(
+                f"Ignoring noise: catalogue reduced from {old_cat_size} entries to {catalogue.shape[0]}"
+            )
+        else:
+            logger.info(
+                f"Assigning noise: {n_noise} noise points will be assigned during iteration"
+            )
+    else:
+        logger.info("No noise points found, entire catalogue will be assigned")
 
-    # iterate until rejection rate stops improving
+    # iterate until the rejection rate stops improving
     prev_reject_rate: float | None = None
     for attempt in range(max_iterations):
         # Step 3: assign all entries
@@ -721,10 +733,6 @@ def build_beq_composites(
     return BEQCompositeComputation(
         inputs=responses_db,
         cycles=iterations,
-        rms_limit=rms_limit,
-        max_limit=max_limit,
-        cosine_limit=cosine_limit,
-        derivative_limit=derivative_limit,
     )
 
 
@@ -752,3 +760,12 @@ def mark_suboptimal_mappings(
                 for m in mappings:
                     if m.composite_id != best_mapping_by_rms_delta.composite_id:
                         m.rejection_reason = RejectionReason.SUBOPTIMAL
+
+
+def merge_calculations(calcs: list[BEQCompositeComputation]) -> BEQCompositeComputation:
+    if not calcs:
+        raise ValueError("No computations to merge")
+
+    output = BEQCompositeComputation(calcs[0].inputs, None)
+
+    return output

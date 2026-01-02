@@ -840,10 +840,6 @@ class ComputationCycle:
 class BEQCompositeComputation:
     inputs: np.ndarray
     cycles: list[ComputationCycle]
-    rms_limit: float
-    max_limit: float
-    cosine_limit: float
-    derivative_limit: float
 
     @property
     def result(self) -> ComputationCycle:
@@ -860,6 +856,10 @@ class BEQCompositeComputation:
     @property
     def total_rejected_count(self) -> int:
         return sum([len(c.rejected_entry_ids) for c in self.result.composites])
+
+    @property
+    def reject_rate(self) -> float:
+        return self.result.reject_rate(self.input_count)
 
 
 # ------------------------------
