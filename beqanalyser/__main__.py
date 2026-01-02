@@ -12,9 +12,7 @@ from beqanalyser.reporter import (
     plot_assigned_fan_curves,
     plot_composite_evolution,
     plot_histograms,
-    plot_rejected_by_reason,
     plot_rms_max_scatter,
-    print_assignments,
     summarize_assignments,
 )
 
@@ -54,8 +52,9 @@ if __name__ == "__main__":
         hdbscan_cluster_selection_epsilon=0.5,
         hdbscan_use_constraints=use_constraints,
     )
+    summarize_assignments(all_calc)
 
-    reject_only_calc = build_beq_composites(
+    reject_only_calc_1 = build_beq_composites(
         responses_db=responses_db[all_calc.result.rejected_entry_ids],
         freqs=freqs,
         weights=weights,
@@ -70,9 +69,10 @@ if __name__ == "__main__":
         hdbscan_cluster_selection_epsilon=1.0,
         hdbscan_use_constraints=use_constraints,
     )
+    summarize_assignments(reject_only_calc_1)
 
     reject_only_calc_2 = build_beq_composites(
-        responses_db=responses_db[reject_only_calc.result.rejected_entry_ids],
+        responses_db=responses_db[reject_only_calc_1.result.rejected_entry_ids],
         freqs=freqs,
         weights=weights,
         band=(min_freq, max_freq),
@@ -86,9 +86,9 @@ if __name__ == "__main__":
         hdbscan_cluster_selection_epsilon=2.0,
         hdbscan_use_constraints=use_constraints,
     )
+    summarize_assignments(reject_only_calc_2)
 
-    def dump_diagnostics(calculation: BEQCompositeComputation, is_all: bool = False):
-        summarize_assignments(calculation)
+    def dump_diagnostic_charts(calculation: BEQCompositeComputation, is_all: bool = False):
         if is_all:
             plot_histograms(calculation.result)
             plot_rms_max_scatter(calculation)
@@ -96,15 +96,15 @@ if __name__ == "__main__":
         plot_assigned_fan_curves(
             calculation, freqs[(freqs >= min_freq) & (freqs <= max_freq)]
         )
-        if is_all:
-            print_assignments(calculation, catalogue)
-        else:
-            plot_rejected_by_reason(
-                responses_db[:, (freqs >= min_freq) & (freqs <= max_freq)],
-                calculation,
-                freqs[(freqs >= min_freq) & (freqs <= max_freq)],
-            )
+        # if is_all:
+        #     print_assignments(calculation, catalogue)
+        # else:
+        #     plot_rejected_by_reason(
+        #         responses_db[:, (freqs >= min_freq) & (freqs <= max_freq)],
+        #         calculation,
+        #         freqs[(freqs >= min_freq) & (freqs <= max_freq)],
+        #     )
 
-    dump_diagnostics(all_calc, is_all=False)
-    dump_diagnostics(reject_only_calc, is_all=False)
-    dump_diagnostics(reject_only_calc_2, is_all=False)
+    dump_diagnostic_charts(all_calc, is_all=False)
+    dump_diagnostic_charts(reject_only_calc_1, is_all=False)
+    dump_diagnostic_charts(reject_only_calc_2, is_all=False)

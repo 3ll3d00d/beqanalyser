@@ -1,6 +1,7 @@
 import copy
 import logging
 import time
+from multiprocessing import Pool, cpu_count
 from typing import Any
 
 import hdbscan
@@ -24,146 +25,280 @@ logger = logging.getLogger(__name__)
 # ------------------------------
 # Precompute distance matrix for BEQ curves
 # ------------------------------
+def _compute_distance_chunk(args):
+    """
+    Worker function for parallel distance computation.
+
+    Args:
+        args: Tuple of (i, end_i, X_float32, X_normalized, distance_params)
+
+    Returns:
+        Tuple of (i, end_i, rms_results, cos_results, max_results, deriv_results)
+    """
+    a = time.time()
+    i, end_i, X_float32, X_normalized, params = args
+
+    chunk_i_float = X_float32[i:end_i]
+    chunk_i_norm = X_normalized[i:end_i]
+    n_samples = X_float32.shape[0]
+
+    # Initialise result arrays for this chunk
+    rms_row = np.zeros((end_i - i, n_samples), dtype=np.float32)
+    cos_row = np.zeros((end_i - i, n_samples), dtype=np.float32)
+    max_row = np.zeros((end_i - i, n_samples), dtype=np.float32)
+    deriv_row = (
+        np.zeros((end_i - i, n_samples), dtype=np.float32)
+        if params["compute_derivative"]
+        else None
+    )
+
+    # Process in sub-chunks to manage memory
+    for j in range(0, n_samples, params["sub_chunk_size"]):
+        end_j = min(j + params["sub_chunk_size"], n_samples)
+        chunk_j_float = X_float32[j:end_j]
+        chunk_j_norm = X_normalized[j:end_j]
+
+        # Compute differences
+        diff = chunk_i_float[:, None, :] - chunk_j_float[None, :, :]
+
+        # RMS distance
+        rms_dist = np.sqrt(np.mean(diff**2, axis=2))
+        rms_row[:, j:end_j] = rms_dist
+
+        # Max absolute deviation
+        max_abs_diff = np.max(np.abs(diff), axis=2)
+        max_row[:, j:end_j] = max_abs_diff
+
+        # Cosine similarity
+        cos_sim = np.dot(chunk_i_norm, chunk_j_norm.T)
+        cos_sim = np.clip(cos_sim, -1.0, 1.0)
+        cos_row[:, j:end_j] = cos_sim
+
+        # Derivative RMS if requested
+        if params["compute_derivative"]:
+            # Compute derivative of differences (finite difference)
+            diff_deriv = np.diff(diff, axis=2)
+            deriv_rms = np.sqrt(np.mean(diff_deriv**2, axis=2))
+            deriv_row[:, j:end_j] = deriv_rms
+
+    b = time.time()
+    logger.info(f"Computed chunk {i}-{end_i} in {b-a:.3f}s")
+    return i, end_i, rms_row, cos_row, max_row, deriv_row
+
+
 def compute_beq_distance_matrix(
     X: np.ndarray,
-    chunk_size: int = 5000,
-    rms_weight: float = 0.9,
-    cosine_weight: float = 0.1,
+    chunk_size: int = 1000,
+    rms_weight: float = 0.5,
+    cosine_weight: float = 0.5,
     cosine_scale: float = 10.0,
     rms_limit: float | None = None,
     cosine_limit: float | None = None,
     max_limit: float | None = None,
+    derivative_limit: float | None = None,
     penalty_scale: float = 100.0,
+    # tolerance parameters
+    rms_undershoot_tolerance: float = 2.0,
+    rms_close_threshold: float = 2.0,
+    cosine_boost_in_close_range: float = 2.0,
+    soft_limit_factor: float = 0.7,
+    soft_penalty_scale: float = 10.0,
+    n_jobs: int = -1,
 ) -> np.ndarray:
     """
-    Precompute pairwise distance matrix combining RMS and cosine distance.
+    Precompute pairwise distance matrix with a sophisticated penalty structure.
 
-    Uses chunked computation to avoid memory explosion from broadcasting.
-    Optionally applies heavy penalties to distances that violate acceptance criteria.
+    Features:
+    1. Asymmetric RMS penalties (tolerant to undershoot, harsh on overshoot)
+    2. Cosine boosting when RMS is close
+    3. Tiered penalty system (soft/hard limits)
+    4. Parallel processing
 
     Args:
         X: Input data matrix (n_samples, n_features)
-        chunk_size: Number of rows to process at once (adjust based on available memory)
-        rms_weight: Weight for RMS component (default: 0.5)
-        cosine_weight: Weight for cosine component (default: 0.5)
-        cosine_scale: Scaling factor for cosine distance to match RMS range (default: 10.0)
-        rms_limit: If set, heavily penalize pairs with RMS > this limit
-        cosine_limit: If set, heavily penalize pairs with cosine similarity < this limit
-        max_limit: If set, heavily penalize pairs with max absolute deviation > this limit
-        penalty_scale: How much to increase distance for violating pairs (default: 100.0)
+        chunk_size: Number of rows to process at once
+        rms_weight: Base weight for RMS component
+        cosine_weight: Base weight for cosine component
+        cosine_scale: Scaling factor for cosine distance
+        rms_limit: Hard upper limit for RMS
+        cosine_limit: Hard lower limit for cosine similarity
+        max_limit: Hard upper limit for max absolute deviation
+        derivative_limit: Hard upper limit for derivative RMS
+        penalty_scale: Penalty multiplier for hard limit violations
+        rms_undershoot_tolerance: Extra tolerance for RMS undershoot (default: 2.0)
+        rms_close_threshold: RMS threshold for "close" range (default: 2.0)
+        cosine_boost_in_close_range: Cosine weight multiplier when RMS is close (default: 2.0)
+        soft_limit_factor: Multiplier for soft limit (default: 0.7 = 70% of hard limit)
+        soft_penalty_scale: Penalty for soft limit violations (default: 10.0)
+        n_jobs: Number of parallel jobs (-1 = all CPUs, 1 = no parallelism)
 
     Returns:
-        Distance matrix (n_samples, n_samples) - symmetric with zeros on diagonal
+        Distance matrix (n_samples, n_samples)
     """
     n_samples = X.shape[0]
-    logger.info(
-        f"Computing distance matrix for {n_samples} samples in chunks of {chunk_size}..."
-    )
-    logger.info(
-        f"Distance weights: RMS={rms_weight}, Cosine={cosine_weight} (scale={cosine_scale})"
-    )
+    n_cores = cpu_count() if n_jobs == -1 else max(1, n_jobs)
 
-    if rms_limit or cosine_limit or max_limit:
+    logger.info(
+        f"Computing distance matrix for {n_samples} samples using {n_cores} cores..."
+    )
+    logger.info(
+        f"Base weights: RMS={rms_weight}, Cosine={cosine_weight} (scale={cosine_scale})"
+    )
+    logger.info(
+        f"RMS undershoot tolerance: {rms_undershoot_tolerance}, close threshold: {rms_close_threshold}"
+    )
+    logger.info(f"Cosine boost in close range: {cosine_boost_in_close_range}x")
+
+    if rms_limit or cosine_limit or max_limit or derivative_limit:
+        soft_limits = {
+            "rms": rms_limit * soft_limit_factor if rms_limit else None,
+            "cosine": cosine_limit + (1.0 - cosine_limit) * (1.0 - soft_limit_factor)
+            if cosine_limit
+            else None,
+            "max": max_limit * soft_limit_factor if max_limit else None,
+            "derivative": derivative_limit * soft_limit_factor
+            if derivative_limit
+            else None,
+        }
         logger.info(
-            f"Applying penalties for: RMS>{rms_limit}, Cosine<{cosine_limit}, Max>{max_limit} "
-            f"(penalty_scale={penalty_scale})"
+            f"Hard limits: RMS={rms_limit}, Cosine={cosine_limit}, Max={max_limit}, Deriv={derivative_limit}"
         )
+        logger.info(
+            f"Soft limits: RMS={soft_limits['rms']}, Cosine={soft_limits['cosine']}, "
+            f"Max={soft_limits['max']}, Deriv={soft_limits['derivative']}"
+        )
+        logger.info(f"Penalties: Soft={soft_penalty_scale}, Hard={penalty_scale}")
 
-    # Preallocate distance matrix as float64 (required by HDBSCAN)
+    # Preallocate distance matrix as float64
     distance_matrix = np.zeros((n_samples, n_samples), dtype=np.float64)
 
-    # Track violations if penalties are enabled
-    if rms_limit or cosine_limit or max_limit:
-        penalty_matrix = np.zeros((n_samples, n_samples), dtype=np.float64)
-
-    # Precompute normalized vectors for cosine distance (use float32 for intermediate computation)
+    # Precompute normalised vectors for cosine
     norms = np.linalg.norm(X, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     X_normalized = (X / norms).astype(np.float32)
-
-    # Compute cosine similarity matrix in chunks
-    logger.info("Computing cosine distances...")
-    a = time.time()
-    for i in range(0, n_samples, chunk_size):
-        a1 = time.time()
-        end_i = min(i + chunk_size, n_samples)
-        chunk_i = X_normalized[i:end_i]
-
-        # Compute cosine similarity for this chunk against all samples
-        cos_sim = np.dot(chunk_i, X_normalized.T)
-        cos_sim = np.clip(cos_sim, -1.0, 1.0)
-        cos_dist = 1.0 - cos_sim
-
-        # Store in distance matrix (scaled and weighted), converting to float64
-        distance_matrix[i:end_i, :] = (cosine_weight * cos_dist * cosine_scale).astype(
-            np.float64
-        )
-
-        # Check cosine limit violations
-        if cosine_limit is not None:
-            violations = cos_sim < cosine_limit
-            penalty_matrix[i:end_i, :] += violations.astype(np.float64)
-
-        logger.info(
-            f"  Processed {end_i}/{n_samples} rows for cosine distance in {time.time() - a1:.2f}s"
-        )
-    logger.info(f"Cosine distance computation completed in {time.time() - a:.2f}s")
-
-    # Compute RMS distance matrix in chunks and add to distance matrix
-    logger.info("Computing RMS distances...")
-    a = time.time()
     X_float32 = X.astype(np.float32)
 
-    # Computes RMS distances in chunks; applies limit violations
+    # Prepare worker parameters
+    compute_derivative = derivative_limit is not None
+    worker_params = {
+        "sub_chunk_size": min(int(chunk_size / 2), min(chunk_size, 2500)),
+        "compute_derivative": compute_derivative,
+    }
+
+    # Prepare chunk arguments for parallel processing
+    chunk_args = []
     for i in range(0, n_samples, chunk_size):
-        a1 = time.time()
         end_i = min(i + chunk_size, n_samples)
-        chunk_i = X_float32[i:end_i]
+        chunk_args.append((i, end_i, X_float32, X_normalized, worker_params))
 
-        for j in range(0, n_samples, chunk_size):
-            end_j = min(j + chunk_size, n_samples)
-            chunk_j = X_float32[j:end_j]
+    # Process chunks in parallel
+    logger.info(f"Computing base distances on {n_cores} cores in {len(chunk_args)} chunks")
+    a = time.time()
+    if n_cores > 1:
+        with Pool(processes=min(n_cores, len(chunk_args))) as pool:
+            results = pool.map(_compute_distance_chunk, chunk_args)
+    else:
+        results = [_compute_distance_chunk(args) for args in chunk_args]
+    b = time.time()
+    logger.info(f"Computed base distances in {b-a:.3f}s")
 
-            # Compute differences for this block
-            diff = chunk_i[:, None, :] - chunk_j[None, :, :]
+    # Assemble results and compute sophisticated distance
+    logger.info("Assembling distance matrix with sophisticated penalties...")
 
-            # Compute RMS: sqrt(mean((xi - xj)^2))
-            rms_dist = np.sqrt(np.mean(diff**2, axis=2))
+    for i, end_i, rms_row, cos_row, max_row, deriv_row in results:
+        n_rows = end_i - i
 
-            # Add to the existing distance matrix (weighted), converting to float64
-            distance_matrix[i:end_i, j:end_j] += (rms_weight * rms_dist).astype(
-                np.float64
+        # Convert cosine similarity to distance
+        cos_dist = 1.0 - cos_row
+
+        # 1. Asymmetric RMS handling
+        # For each pair, check if it undershoots or overshoots
+        # Undershoot: curve i is lower than curve j (negative mean difference)
+        mean_diff = np.mean(X_float32[i:end_i, None, :] - X_float32[None, :, :], axis=2)
+        is_undershoot = mean_diff < 0
+
+        # Apply tolerance to undershoot
+        rms_adjusted = rms_row.copy()
+        if rms_undershoot_tolerance > 1.0:
+            undershoot_factor = 1.0 / rms_undershoot_tolerance
+            rms_adjusted = np.where(is_undershoot, rms_row * undershoot_factor, rms_row)
+
+        # 2. Detect "close" RMS range and boost cosine weight
+        is_close = rms_row < rms_close_threshold
+        cosine_weight_adjusted = np.where(
+            is_close, cosine_weight * cosine_boost_in_close_range, cosine_weight
+        )
+
+        # Compute base distance with adaptive weighting
+        base_distance = (
+            rms_weight * rms_adjusted + cosine_weight_adjusted * cos_dist * cosine_scale
+        )
+
+        # 3. Tiered penalty system
+        penalty = np.zeros((n_rows, n_samples), dtype=np.float32)
+
+        if rms_limit is not None:
+            soft_rms = soft_limits["rms"]
+            # Soft penalty zone
+            soft_violations = (rms_row > soft_rms) & (rms_row <= rms_limit)
+            penalty += soft_violations.astype(np.float32) * soft_penalty_scale
+            # Hard penalty zone (overshoot only - undershoot gets tolerance)
+            hard_violations = (rms_row > rms_limit) & ~is_undershoot
+            penalty += hard_violations.astype(np.float32) * penalty_scale
+            # Undershoot hard violations get a reduced penalty
+            hard_undershoot = (rms_row > rms_limit) & is_undershoot
+            penalty += hard_undershoot.astype(np.float32) * (
+                penalty_scale / rms_undershoot_tolerance
             )
 
-            # Check RMS limit violations
-            if rms_limit is not None:
-                violations = rms_dist > rms_limit
-                penalty_matrix[i:end_i, j:end_j] += violations.astype(np.float64)
+        if cosine_limit is not None:
+            soft_cos = soft_limits["cosine"]
+            cos_sim = 1.0 - cos_dist
+            # Soft penalty zone
+            soft_violations = (cos_sim < soft_cos) & (cos_sim >= cosine_limit)
+            penalty += soft_violations.astype(np.float32) * soft_penalty_scale
+            # Hard penalty zone
+            hard_violations = cos_sim < cosine_limit
+            penalty += hard_violations.astype(np.float32) * penalty_scale
 
-            # Check max absolute deviation violations
-            if max_limit is not None:
-                max_abs_diff = np.max(np.abs(diff), axis=2)
-                violations = max_abs_diff > max_limit
-                penalty_matrix[i:end_i, j:end_j] += violations.astype(np.float64)
+        if max_limit is not None:
+            soft_max = soft_limits["max"]
+            # Soft penalty zone
+            soft_violations = (max_row > soft_max) & (max_row <= max_limit)
+            penalty += soft_violations.astype(np.float32) * soft_penalty_scale
+            # Hard penalty zone
+            hard_violations = max_row > max_limit
+            penalty += hard_violations.astype(np.float32) * penalty_scale
 
+        if derivative_limit is not None and deriv_row is not None:
+            soft_deriv = soft_limits["derivative"]
+            # Soft penalty zone
+            soft_violations = (deriv_row > soft_deriv) & (deriv_row <= derivative_limit)
+            penalty += soft_violations.astype(np.float32) * soft_penalty_scale
+            # Hard penalty zone
+            hard_violations = deriv_row > derivative_limit
+            penalty += hard_violations.astype(np.float32) * penalty_scale
+
+        # Combine base distance with penalties
+        distance_matrix[i:end_i, :] = (base_distance + penalty).astype(np.float64)
+
+        logger.info(f"  Processed {end_i}/{n_samples} rows")
+
+    c = time.time()
+    logger.info(f"Computed distance final in {c-b:.3f}s")
+
+    # Log penalty statistics
+    if rms_limit or cosine_limit or max_limit or derivative_limit:
+        n_soft = np.sum((distance_matrix > 0) & (distance_matrix < penalty_scale))
+        n_hard = np.sum(distance_matrix >= penalty_scale)
+        total_pairs = n_samples * n_samples
         logger.info(
-            f"  Processed {end_i}/{n_samples} rows for RMS distance in {time.time() - a1:.2f}s"
+            f"Penalties: {n_soft:,} soft violations ({100.0 * n_soft / total_pairs:.2f}%), "
+            f"{n_hard:,} hard violations ({100.0 * n_hard / total_pairs:.2f}%)"
         )
-    logger.info(f"RMS distance computation completed in {time.time() - a:.2f}s")
-
-    # Apply penalties for violations
-    if rms_limit or cosine_limit or max_limit:
-        n_violations = np.sum(penalty_matrix > 0)
-        pct_violations = 100.0 * n_violations / (n_samples * n_samples)
-        logger.info(
-            f"Found {n_violations:,} violating pairs ({pct_violations:.2f}% of total)"
-        )
-
-        # Add heavy penalty to violating pairs
-        distance_matrix += penalty_matrix * penalty_scale
 
     logger.info(
-        f"Distance matrix computed. Range: [{distance_matrix.min():.3f}, {distance_matrix.max():.3f}]"
+        f"Distance matrix computed in {c-a:.3f}s. Range: [{distance_matrix.min():.3f}, {distance_matrix.max():.3f}]"
     )
     return distance_matrix
 
@@ -183,7 +318,14 @@ def hdbscan_clustering(
     distance_rms_limit: float | None = None,
     distance_cosine_limit: float | None = None,
     distance_max_limit: float | None = None,
+    distance_derivative_limit: float | None = None,
     distance_penalty_scale: float = 100.0,
+    distance_rms_undershoot_tolerance: float = 2.0,
+    distance_rms_close_threshold: float = 2.0,
+    distance_cosine_boost_in_close_range: float = 2.0,
+    distance_soft_limit_factor: float = 0.7,
+    distance_soft_penalty_scale: float = 10.0,
+    distance_n_jobs: int = -1,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Use HDBSCAN to identify natural cluster structure directly.
@@ -200,14 +342,21 @@ def hdbscan_clustering(
         distance_rms_limit: If set, penalize pairs with RMS > limit
         distance_cosine_limit: If set, penalize pairs with cosine similarity < limit
         distance_max_limit: If set, penalize pairs with max absolute deviation > limit
-        distance_penalty_scale: Penalty multiplier for violating pairs (default: 100.0)
+        distance_derivative_limit: If set, penalize pairs with derivative RMS > limit
+        distance_penalty_scale: Penalty multiplier for hard limit violations (default: 100.0)
+        distance_rms_undershoot_tolerance: Extra tolerance for RMS undershoot (default: 2.0)
+        distance_rms_close_threshold: RMS threshold for "close" range (default: 2.0)
+        distance_cosine_boost_in_close_range: Cosine weight boost when RMS is close (default: 2.0)
+        distance_soft_limit_factor: Soft limit as fraction of hard limit (default: 0.7)
+        distance_soft_penalty_scale: Penalty for soft limit violations (default: 10.0)
+        distance_n_jobs: Number of parallel jobs (-1 = all CPUs, 1 = sequential)
 
     Returns:
         Tuple of (cluster_labels, cluster_medoids)
         - cluster_labels: Array of cluster assignments for each input
         - cluster_medoids: Representative curves (medoid) for each cluster
     """
-    # Precompute distance matrix for much faster clustering
+    # Precompute distance matrix with sophisticated penalties
     distance_matrix = compute_beq_distance_matrix(
         X,
         chunk_size=distance_chunk_size,
@@ -217,7 +366,14 @@ def hdbscan_clustering(
         rms_limit=distance_rms_limit,
         cosine_limit=distance_cosine_limit,
         max_limit=distance_max_limit,
+        derivative_limit=distance_derivative_limit,
         penalty_scale=distance_penalty_scale,
+        rms_undershoot_tolerance=distance_rms_undershoot_tolerance,
+        rms_close_threshold=distance_rms_close_threshold,
+        cosine_boost_in_close_range=distance_cosine_boost_in_close_range,
+        soft_limit_factor=distance_soft_limit_factor,
+        soft_penalty_scale=distance_soft_penalty_scale,
+        n_jobs=distance_n_jobs,
     )
 
     # Run HDBSCAN clustering with precomputed distances
@@ -263,7 +419,7 @@ def hdbscan_clustering(
         medoid_idx = np.argmin(distances)
         cluster_medoids.append(cluster_points[medoid_idx])
 
-    # Keep noise points as noise (label=-1) - they will be handled during the assignment phase
+    # Keep noise points as noise (label=-1) - they will be handled during assignment phase
     # The iterative refinement will attempt to assign them, and they'll be rejected if they
     # don't meet the acceptance criteria
 
@@ -397,9 +553,6 @@ def compute_fan_curves(
 # ------------------------------
 # Full pipeline
 # ------------------------------
-# ------------------------------
-# Full pipeline
-# ------------------------------
 def build_beq_composites(
     responses_db: np.ndarray,
     freqs: np.ndarray,
@@ -414,14 +567,20 @@ def build_beq_composites(
     max_iterations: int = 10,
     min_reject_rate_delta: float = 0.005,
     hdbscan_min_cluster_size: int = 500,
-    hdbscan_min_samples: int = 50,
+    hdbscan_min_samples: int | None = 50,
     hdbscan_cluster_selection_epsilon: float = 0.0,
-    hdbscan_distance_chunk_size: int = 1000,
-    hdbscan_distance_rms_weight: float = 0.5,
-    hdbscan_distance_cosine_weight: float = 0.5,
+    hdbscan_distance_chunk_size: int = 5000,
+    hdbscan_distance_rms_weight: float = 0.8,
+    hdbscan_distance_cosine_weight: float = 0.2,
     hdbscan_distance_cosine_scale: float = 10.0,
     hdbscan_use_constraints: bool = True,
     hdbscan_distance_penalty_scale: float = 100.0,
+    hdbscan_distance_rms_undershoot_tolerance: float = 2.0,
+    hdbscan_distance_rms_close_threshold: float = 2.0,
+    hdbscan_distance_cosine_boost_in_close_range: float = 2.0,
+    hdbscan_distance_soft_limit_factor: float = 0.7,
+    hdbscan_distance_soft_penalty_scale: float = 10.0,
+    hdbscan_distance_n_jobs: int = -1,
 ) -> BEQCompositeComputation:
     """
     Build BEQ composite filters using HDBSCAN clustering.
@@ -447,7 +606,13 @@ def build_beq_composites(
         hdbscan_distance_cosine_weight: Weight for cosine component in distance (default: 0.5)
         hdbscan_distance_cosine_scale: Scaling factor for cosine to match RMS range (default: 10.0)
         hdbscan_use_constraints: If True, penalize pairs that violate acceptance criteria (default: True)
-        hdbscan_distance_penalty_scale: Penalty multiplier for constraint violations (default: 100.0)
+        hdbscan_distance_penalty_scale: Hard penalty multiplier for constraint violations (default: 100.0)
+        hdbscan_distance_rms_undershoot_tolerance: Tolerance factor for RMS undershoot (default: 2.0)
+        hdbscan_distance_rms_close_threshold: RMS threshold for cosine boosting (default: 2.0)
+        hdbscan_distance_cosine_boost_in_close_range: Cosine weight multiplier when close (default: 2.0)
+        hdbscan_distance_soft_limit_factor: Soft limit as fraction of hard limit (default: 0.7)
+        hdbscan_distance_soft_penalty_scale: Soft penalty multiplier (default: 10.0)
+        hdbscan_distance_n_jobs: Number of parallel jobs for distance computation (default: -1 = all CPUs)
 
     Returns:
         BEQCompositeComputation with all cycles and final composites
@@ -477,7 +642,14 @@ def build_beq_composites(
         distance_rms_limit=rms_limit if hdbscan_use_constraints else None,
         distance_cosine_limit=cosine_limit if hdbscan_use_constraints else None,
         distance_max_limit=max_limit if hdbscan_use_constraints else None,
+        distance_derivative_limit=derivative_limit if hdbscan_use_constraints else None,
         distance_penalty_scale=hdbscan_distance_penalty_scale,
+        distance_rms_undershoot_tolerance=hdbscan_distance_rms_undershoot_tolerance,
+        distance_rms_close_threshold=hdbscan_distance_rms_close_threshold,
+        distance_cosine_boost_in_close_range=hdbscan_distance_cosine_boost_in_close_range,
+        distance_soft_limit_factor=hdbscan_distance_soft_limit_factor,
+        distance_soft_penalty_scale=hdbscan_distance_soft_penalty_scale,
+        distance_n_jobs=hdbscan_distance_n_jobs,
     )
 
     n_clusters = len(cluster_medoids)
@@ -502,7 +674,7 @@ def build_beq_composites(
             f"({n_noise} noise points will be assigned during iteration)"
         )
 
-    # iterate until the rejection rate stops improving
+    # iterate until rejection rate stops improving
     prev_reject_rate: float | None = None
     for attempt in range(max_iterations):
         # Step 3: assign all entries
