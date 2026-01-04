@@ -797,16 +797,12 @@ class BEQComposite:
 
     @property
     def rejected_entry_ids(self) -> list[int]:
-        return [m.entry_id for m in self.mappings if m.rejection_reason is not None and m.is_best]
+        return list(set([m.entry_id for m in self.mappings if m.rejection_reason is not None and m.is_best]))
 
     def rejected_mappings_for_reason(
-        self, reason: RejectionReason
+        self, reason: RejectionReason, best_only: bool = False
     ) -> list[BEQFilterMapping]:
-        return [m for m in self.mappings if m.rejection_reason == reason and m.is_best]
-
-    @property
-    def all_entry_ids(self) -> list[int]:
-        return [m.entry_id for m in self.mappings if m.is_best]
+        return [m for m in self.mappings if m.rejection_reason == reason and m.is_best == best_only]
 
 
 @dataclass
@@ -819,21 +815,24 @@ class ComputationCycle:
 
     @property
     def reject_count(self) -> int:
-        return sum(self.reject_reason_counts.values())
+        return len(self.rejected_entry_ids)
 
     @property
     def reject_reason_counts(self) -> dict[RejectionReason, int]:
         counts = defaultdict(int)
-        for c in self.composites:
+        seen_ids = set()
+        for c in reversed(self.composites):
             for m in c.mappings:
                 if m.rejection_reason is not None and m.is_best:
-                    counts[m.rejection_reason] += 1
+                    pre_size = len(seen_ids)
+                    seen_ids.add(m.entry_id)
+                    if pre_size != len(seen_ids):
+                        counts[m.rejection_reason] += 1
         return counts
 
     @property
     def rejected_entry_ids(self) -> list[int]:
-        return sorted([e for m in self.composites for e in m.rejected_entry_ids])
-
+        return sorted(set([e for m in self.composites for e in m.rejected_entry_ids]))
 
 
 @dataclass
@@ -847,7 +846,7 @@ class BEQCompositeComputation:
 
     @property
     def input_count(self) -> int:
-        return self.inputs.shape[0]
+        return self.total_assigned_count + self.total_rejected_count
 
     @property
     def total_assigned_count(self) -> int:
@@ -860,6 +859,29 @@ class BEQCompositeComputation:
     @property
     def reject_rate(self) -> float:
         return self.result.reject_rate(self.input_count)
+
+
+@dataclass
+class BEQResult:
+    inputs: np.ndarray
+    composites: list[BEQComposite]
+    calculations: list[BEQCompositeComputation]
+
+    @property
+    def total_assigned_count(self):
+        return sum([len(c.assigned_entry_ids) for c in self.composites])
+
+    @property
+    def total_rejected_count(self):
+        return self.input_size - self.total_assigned_count
+
+    @property
+    def reject_rate(self):
+        return self.total_rejected_count / self.input_size
+
+    @property
+    def input_size(self) -> int:
+        return self.inputs.shape[0]
 
 
 # ------------------------------

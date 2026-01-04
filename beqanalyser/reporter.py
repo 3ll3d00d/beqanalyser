@@ -4,21 +4,37 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
-from matplotlib.ticker import FormatStrFormatter, StrMethodFormatter
+from matplotlib.ticker import StrMethodFormatter
 from scipy.stats import gaussian_kde
 
 from beqanalyser import (
+    BEQComposite,
     BEQCompositeComputation,
     BEQFilter,
-    ComputationCycle,
-    RejectionReason,
+    RejectionReason, BEQResult,
 )
 
 logger = logging.getLogger()
 
+def summarise_result(result: BEQResult) -> None:
+    logger.info('---------------')
+    logger.info('Final Result')
+    logger.info('---------------')
+    logger.info(f"Catalogue entries: {result.input_size}")
+    logger.info(f"Assigned: {result.total_assigned_count} ({result.total_assigned_count / result.input_size:.1%})")
+    logger.info(f"Rejected: {result.total_rejected_count} ({result.total_rejected_count / result.input_size:.1%})")
 
-def summarize_assignments(computation: BEQCompositeComputation) -> None:
-    logger.info(f"Total catalogue entries: {computation.inputs.shape[0]}")
+    logger.info("Composite assignment counts:")
+    for comp in result.composites:
+        assigned_count = len(comp.assigned_entry_ids)
+        logger.info(f"  Composite {comp.id}: {assigned_count} assigned ({assigned_count / result.input_size:.1%})")
+
+
+def summarise_assignments(iteration: int, computation: BEQCompositeComputation, level: int = logging.INFO) -> None:
+    logger.log(level, '---------------')
+    logger.log(level, f"Iteration {iteration}")
+    logger.log(level, '---------------')
+    logger.log(level, f"Total catalogue entries: {computation.inputs.shape[0]}")
 
     logger.info("Composite assignment counts:")
     for comp in computation.result.composites:
@@ -143,10 +159,10 @@ def plot_composite_evolution(
 
 
 def plot_assigned_fan_curves(
-    computation: BEQCompositeComputation, freqs: np.ndarray
+    composites: list[BEQComposite], freqs: np.ndarray
 ) -> None:
     """Plot assigned fan curves and composite shapes."""
-    n_comps = len(computation.result.composites)
+    n_comps = len(composites)
     ncols = min(3, n_comps)
     nrows = (n_comps + ncols - 1) // ncols
     fig, axes = plt.subplots(
@@ -154,7 +170,7 @@ def plot_assigned_fan_curves(
     )
     axes = np.array(axes).flatten() if n_comps > 1 else np.array([axes])
 
-    for comp in computation.result.composites:
+    for comp in composites:
         ax: Axes = axes[comp.id]
 
         # Fan curves
@@ -184,6 +200,7 @@ def plot_assigned_fan_curves(
         ax.xaxis.set_major_formatter(StrMethodFormatter('{x:.0f}'))
         ax.xaxis.set_minor_formatter(StrMethodFormatter('{x:.0f}'))
         ax.xaxis.set_tick_params(which='both', labelsize=6)
+        # ax.set_ylim(bottom=0)
 
         # Inset histogram for RMS of assigned curves
         inset = ax.inset_axes([0.65, 0.65, 0.32, 0.32])
@@ -228,7 +245,7 @@ def plot_rejected_by_reason(
         for comp in computation.result.composites:
             ax: Axes = axes[comp.id]
 
-            rejected_entries = comp.rejected_mappings_for_reason(reason)
+            rejected_entries = comp.rejected_mappings_for_reason(reason, best_only=True)
             if not rejected_entries:
                 continue
 
@@ -297,11 +314,11 @@ def plot_rejected_by_reason(
 # ------------------------------
 # RMS vs Max scatter with density
 # ------------------------------
-def plot_rms_max_scatter(computation: BEQCompositeComputation) -> None:
+def plot_rms_max_scatter(composites: list[BEQComposite]) -> None:
     all_rms: np.ndarray = np.array(
         [
             m.rms_delta
-            for c in computation.result.composites
+            for c in composites
             for m in c.mappings
             if m.is_best
         ]
@@ -309,7 +326,7 @@ def plot_rms_max_scatter(computation: BEQCompositeComputation) -> None:
     all_max: np.ndarray = np.array(
         [
             m.max_delta
-            for c in computation.result.composites
+            for c in composites
             for m in c.mappings
             if m.is_best
         ]
@@ -327,28 +344,28 @@ def plot_rms_max_scatter(computation: BEQCompositeComputation) -> None:
     plt.show()
 
 
-def plot_histograms(result: ComputationCycle) -> None:
+def plot_histograms(composites: list[BEQComposite]) -> None:
     rms_vals: list[float] = [
         m.rms_delta
-        for c in result.composites
+        for c in composites
         for m in c.mappings
         if m.rms_delta is not None and m.is_best
     ]
     max_vals: list[float] = [
         m.max_delta
-        for c in result.composites
+        for c in composites
         for m in c.mappings
         if m.max_delta is not None and m.is_best
     ]
     cosine_vals: list[float] = [
         m.cosine_similarity
-        for c in result.composites
+        for c in composites
         for m in c.mappings
         if m.cosine_similarity is not None and m.is_best
     ]
     derivative_deltas: list[float] = [
         m.derivative_delta
-        for c in result.composites
+        for c in composites
         for m in c.mappings
         if m.derivative_delta is not None and m.is_best
     ]
@@ -413,7 +430,7 @@ def plot_histograms(result: ComputationCycle) -> None:
 
 
 def print_assignments(
-    computation: BEQCompositeComputation, filters: list[BEQFilter]
+    composites: list[BEQComposite], filters: list[BEQFilter]
 ) -> None:
     with open("beq_composites.csv", "w", newline="") as f:
         import csv
@@ -435,7 +452,7 @@ def print_assignments(
                 "beqc url",
             ]
         )
-        for c in computation.result.composites:
+        for c in composites:
             for m in c.mappings:
                 if m.is_best:
                     underlying: BEQFilter = filters[m.entry_id]

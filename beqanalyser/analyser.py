@@ -1,6 +1,8 @@
 import copy
+import dataclasses
 import logging
 import time
+from dataclasses import dataclass, fields, MISSING
 from multiprocessing import Pool, cpu_count
 from typing import Any
 
@@ -16,10 +18,139 @@ from beqanalyser import (
     RejectionReason,
     cosine_similarity,
     derivative_rms,
-    rms,
+    rms, BEQResult,
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True, repr=True)
+class HDBSCANParams:
+    """
+    Configuration parameters for HDBSCAN-based clustering and custom
+    distance computation used during BEQ composite construction.
+
+    This groups all HDBSCAN-related knobs, including clustering behaviour,
+    distance weighting, constraint handling, and parallelism.
+    """
+
+    # --- Acceptance / rejection limits ---
+
+    rms_limit: float = 10.0
+    """Maximum acceptable RMS deviation for assignment."""
+
+    max_limit: float = 10.0
+    """Maximum acceptable absolute deviation."""
+
+    cosine_limit: float = 0.90
+    """Minimum acceptable cosine similarity."""
+
+    derivative_limit: float = 1.0
+    """Maximum acceptable derivative RMS."""
+
+    # --- Core HDBSCAN parameters ---
+
+    min_cluster_size: int = 500
+    """Minimum cluster size for HDBSCAN (controls number of clusters)."""
+
+    min_samples: int | None = 50
+    """Minimum samples for core points (controls cluster density)."""
+
+    cluster_selection_epsilon: float = 0.0
+    """Distance threshold for merging clusters (0.0 = no merging)."""
+
+    # --- Distance computation configuration ---
+
+    distance_chunk_size: int = 1000
+    """
+    Chunk size for distance computation
+    (lower = less memory usage, default: 1000).
+    """
+
+    distance_rms_weight: float = 0.8
+    """Weight for RMS component in distance metric."""
+
+    distance_cosine_weight: float = 0.2
+    """Weight for cosine similarity component in distance metric."""
+
+    distance_cosine_scale: float = 10.0
+    """
+    Scaling factor applied to cosine distance to match RMS magnitude.
+    """
+
+    # --- Constraint / penalty handling ---
+
+    use_constraints: bool = True
+    """
+    If True, penalize curve pairs that violate acceptance criteria
+    (e.g. RMS, max, cosine limits).
+    """
+
+    distance_penalty_scale: float = 100.0
+    """
+    Hard penalty multiplier applied to constraint violations.
+    """
+
+    distance_rms_undershoot_tolerance: float = 2.0
+    """
+    Tolerance factor for RMS undershoot before penalties are applied.
+    """
+
+    distance_rms_close_threshold: float = 2.0
+    """
+    RMS threshold below which cosine similarity is boosted.
+    """
+
+    distance_cosine_boost_in_close_range: float = 2.0
+    """
+    Multiplier applied to cosine weight when curves are RMS-close.
+    """
+
+    # --- Soft limiting ---
+
+    distance_soft_limit_factor: float = 0.7
+    """
+    Soft limit expressed as a fraction of the hard rejection limit.
+    """
+
+    distance_soft_penalty_scale: float = 10.0
+    """
+    Penalty multiplier applied when soft limits are exceeded.
+    """
+
+    # --- Parallelism ---
+
+    distance_n_jobs: int = -1
+    """
+    Number of parallel jobs for distance computation
+    (-1 = use all available CPUs).
+    """
+
+    def __repr__(self) -> str:
+        """
+        Constructs a string representation of the class, including only attributes that
+        are not equal to their default values or do not have a predefined baseline
+        (default value).
+
+        :return: String representation of the object with attributes and their
+                 corresponding values if they differ from the defaults.
+        :rtype: str
+        """
+        parts: list[str] = []
+
+        for f in fields(self):
+            value = getattr(self, f.name)
+
+            if f.default is MISSING:
+                # No baseline → always include
+                parts.append(f"{f.name}={value!r}")
+            elif value != f.default:
+                parts.append(f"{f.name}={value!r}")
+
+        if parts:
+            return f"{self.__class__.__name__}({', '.join(parts)})"
+        else:
+            return f"{self.__class__.__name__}(all defaults)"
 
 
 # ------------------------------
@@ -82,7 +213,7 @@ def _compute_distance_chunk(args):
             deriv_row[:, j:end_j] = deriv_rms
 
     b = time.time()
-    logger.info(f"Computed chunk {i}-{end_i} in {b - a:.3f}s")
+    logger.debug(f"Computed chunk {i}-{end_i} in {b - a:.3f}s")
     return i, end_i, rms_row, cos_row, max_row, deriv_row
 
 
@@ -138,16 +269,16 @@ def compute_beq_distance_matrix(
     n_samples = X.shape[0]
     n_cores = cpu_count() if n_jobs == -1 else max(1, n_jobs)
 
-    logger.info(
+    logger.debug(
         f"Computing distance matrix for {n_samples} samples using {n_cores} cores..."
     )
-    logger.info(
+    logger.debug(
         f"Base weights: RMS={rms_weight}, Cosine={cosine_weight} (scale={cosine_scale})"
     )
-    logger.info(
+    logger.debug(
         f"RMS undershoot tolerance: {rms_undershoot_tolerance}, close threshold: {rms_close_threshold}"
     )
-    logger.info(f"Cosine boost in close range: {cosine_boost_in_close_range}x")
+    logger.debug(f"Cosine boost in close range: {cosine_boost_in_close_range}x")
 
     if rms_limit or cosine_limit or max_limit or derivative_limit:
         soft_limits = {
@@ -160,14 +291,14 @@ def compute_beq_distance_matrix(
             if derivative_limit
             else None,
         }
-        logger.info(
+        logger.debug(
             f"Hard limits: RMS={rms_limit}, Cosine={cosine_limit}, Max={max_limit}, Deriv={derivative_limit}"
         )
-        logger.info(
+        logger.debug(
             f"Soft limits: RMS={soft_limits['rms']}, Cosine={soft_limits['cosine']}, "
             f"Max={soft_limits['max']}, Deriv={soft_limits['derivative']}"
         )
-        logger.info(f"Penalties: Soft={soft_penalty_scale}, Hard={penalty_scale}")
+        logger.debug(f"Penalties: Soft={soft_penalty_scale}, Hard={penalty_scale}")
 
     # Preallocate distance matrix as float64
     distance_matrix = np.zeros((n_samples, n_samples), dtype=np.float64)
@@ -205,7 +336,7 @@ def compute_beq_distance_matrix(
     logger.info(f"Computed base distances in {b - a:.3f}s")
 
     # Assemble results and compute sophisticated distance
-    logger.info("Assembling distance matrix with sophisticated penalties...")
+    logger.debug("Assembling distance matrix with sophisticated penalties...")
 
     for i, end_i, rms_row, cos_row, max_row, deriv_row in results:
         n_rows = end_i - i
@@ -284,7 +415,7 @@ def compute_beq_distance_matrix(
         # Combine base distance with penalties
         distance_matrix[i:end_i, :] = (base_distance + penalty).astype(np.float64)
 
-        logger.info(f"  Processed {end_i}/{n_samples} rows")
+        logger.debug(f"  Processed {end_i}/{n_samples} rows")
 
     c = time.time()
     logger.info(f"Computed distance final in {c - b:.3f}s")
@@ -310,48 +441,14 @@ def compute_beq_distance_matrix(
 # ------------------------------
 def hdbscan_clustering(
     X: np.ndarray,
-    min_cluster_size: int = 500,
-    min_samples: int = 50,
-    cluster_selection_epsilon: float = 3.0,
-    distance_chunk_size: int = 1000,
-    distance_rms_weight: float = 0.5,
-    distance_cosine_weight: float = 0.5,
-    distance_cosine_scale: float = 10.0,
-    distance_rms_limit: float | None = None,
-    distance_cosine_limit: float | None = None,
-    distance_max_limit: float | None = None,
-    distance_derivative_limit: float | None = None,
-    distance_penalty_scale: float = 100.0,
-    distance_rms_undershoot_tolerance: float = 2.0,
-    distance_rms_close_threshold: float = 2.0,
-    distance_cosine_boost_in_close_range: float = 2.0,
-    distance_soft_limit_factor: float = 0.7,
-    distance_soft_penalty_scale: float = 10.0,
-    distance_n_jobs: int = -1,
+    hdbscan_params: HDBSCANParams,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Use HDBSCAN to identify natural cluster structure directly.
 
     Args:
         X: Input data matrix (n_samples, n_features)
-        min_cluster_size: Minimum cluster size for HDBSCAN
-        min_samples: Minimum samples parameter for HDBSCAN
-        cluster_selection_epsilon: Distance threshold for cluster merging (0.0 = no merging)
-        distance_chunk_size: Chunk size for distance matrix computation (lower = less memory)
-        distance_rms_weight: Weight for RMS component in distance metric (default: 0.5)
-        distance_cosine_weight: Weight for cosine component in distance metric (default: 0.5)
-        distance_cosine_scale: Scaling factor for cosine distance (default: 10.0)
-        distance_rms_limit: If set, penalize pairs with RMS > limit
-        distance_cosine_limit: If set, penalize pairs with cosine similarity < limit
-        distance_max_limit: If set, penalize pairs with max absolute deviation > limit
-        distance_derivative_limit: If set, penalize pairs with derivative RMS > limit
-        distance_penalty_scale: Penalty multiplier for hard limit violations (default: 100.0)
-        distance_rms_undershoot_tolerance: Extra tolerance for RMS undershoot (default: 2.0)
-        distance_rms_close_threshold: RMS threshold for "close" range (default: 2.0)
-        distance_cosine_boost_in_close_range: Cosine weight boost when RMS is close (default: 2.0)
-        distance_soft_limit_factor: Soft limit as fraction of hard limit (default: 0.7)
-        distance_soft_penalty_scale: Penalty for soft limit violations (default: 10.0)
-        distance_n_jobs: Number of parallel jobs (-1 = all CPUs, 1 = sequential)
+        hdbscan_params: HDBSCAN parameters
 
     Returns:
         Tuple of (cluster_labels, cluster_medoids)
@@ -359,32 +456,37 @@ def hdbscan_clustering(
         - cluster_medoids: Representative curves (medoid) for each cluster
     """
     # Precompute distance matrix with sophisticated penalties
+
     distance_matrix = compute_beq_distance_matrix(
         X,
-        chunk_size=distance_chunk_size,
-        rms_weight=distance_rms_weight,
-        cosine_weight=distance_cosine_weight,
-        cosine_scale=distance_cosine_scale,
-        rms_limit=distance_rms_limit,
-        cosine_limit=distance_cosine_limit,
-        max_limit=distance_max_limit,
-        derivative_limit=distance_derivative_limit,
-        penalty_scale=distance_penalty_scale,
-        rms_undershoot_tolerance=distance_rms_undershoot_tolerance,
-        rms_close_threshold=distance_rms_close_threshold,
-        cosine_boost_in_close_range=distance_cosine_boost_in_close_range,
-        soft_limit_factor=distance_soft_limit_factor,
-        soft_penalty_scale=distance_soft_penalty_scale,
-        n_jobs=distance_n_jobs,
+        chunk_size=hdbscan_params.distance_chunk_size,
+        rms_weight=hdbscan_params.distance_rms_weight,
+        cosine_weight=hdbscan_params.distance_cosine_weight,
+        cosine_scale=hdbscan_params.distance_cosine_scale,
+        rms_limit=hdbscan_params.rms_limit if hdbscan_params.use_constraints else None,
+        cosine_limit=hdbscan_params.cosine_limit
+        if hdbscan_params.use_constraints
+        else None,
+        max_limit=hdbscan_params.max_limit if hdbscan_params.use_constraints else None,
+        derivative_limit=hdbscan_params.derivative_limit
+        if hdbscan_params.use_constraints
+        else None,
+        penalty_scale=hdbscan_params.distance_penalty_scale,
+        rms_undershoot_tolerance=hdbscan_params.distance_rms_undershoot_tolerance,
+        rms_close_threshold=hdbscan_params.distance_rms_close_threshold,
+        cosine_boost_in_close_range=hdbscan_params.distance_cosine_boost_in_close_range,
+        soft_limit_factor=hdbscan_params.distance_soft_limit_factor,
+        soft_penalty_scale=hdbscan_params.distance_soft_penalty_scale,
+        n_jobs=hdbscan_params.distance_n_jobs,
     )
 
     # Run HDBSCAN clustering with precomputed distances
     clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=min_samples,
+        min_cluster_size=hdbscan_params.min_cluster_size,
+        min_samples=hdbscan_params.min_samples,
         metric="precomputed",
         cluster_selection_method="eom",
-        cluster_selection_epsilon=cluster_selection_epsilon,
+        cluster_selection_epsilon=hdbscan_params.cluster_selection_epsilon,
         allow_single_cluster=False,
     )
 
@@ -395,19 +497,16 @@ def hdbscan_clustering(
     n_clusters = len(unique_labels)
     n_noise = np.sum(labels == -1)
 
-    if n_noise > 0:
-        logger.info(
-            f"HDBSCAN identified {n_noise} noise points ({100.0 * n_noise / X.shape[0]:.1f}%)"
-        )
+    logger.info(
+        f"hdbscan identified {n_noise} of {X.shape[0]} as noise({100.0 * n_noise / X.shape[0]:.1f}%) and {n_clusters} clusters"
+    )
 
     if n_clusters == 0:
-        # If HDBSCAN found no clusters (all noise), create a single cluster
         logger.warning(
             "HDBSCAN found no clusters. Creating single cluster from all data."
         )
         labels = np.zeros(X.shape[0], dtype=int)
         unique_labels = np.array([0])
-        n_clusters = 1
 
     # Compute medoid for each cluster (point closest to cluster median)
     cluster_medoids = []
@@ -438,7 +537,7 @@ def map_to_best_composite(
     max_limit: float,
     cosine_limit: float,
     derivative_limit: float,
-    entry_idx: int,
+    entry_id: int,
     weights: np.ndarray | None = None,
     rms_epsilon: float = 1.0,
 ) -> None:
@@ -454,7 +553,7 @@ def map_to_best_composite(
         max_limit: Maximum acceptable absolute deviation
         cosine_limit: Minimum acceptable cosine similarity
         derivative_limit: Maximum acceptable derivative RMS
-        entry_idx: Index of entry in catalogue
+        entry_id: Index of entry in catalogue
         weights: Optional frequency weights for RMS calculation
         rms_epsilon: Tolerance for selecting near-minimum RMS composites
 
@@ -466,7 +565,7 @@ def map_to_best_composite(
         delta = entry - comp.mag_response
         mapping = BEQFilterMapping(
             composite_id=comp.id,
-            entry_id=entry_idx,
+            entry_id=entry_id,
             rms_delta=rms(delta, weights),
             max_delta=float(np.max(np.abs(delta))),
             derivative_delta=derivative_rms(delta),
@@ -555,68 +654,107 @@ def compute_fan_curves(
 # ------------------------------
 # Full pipeline
 # ------------------------------
-def build_beq_composites(
-    responses_db: np.ndarray,
+def build_all_composites(
+    input_curves: np.ndarray,
     freqs: np.ndarray,
+    iteration_params: list[HDBSCANParams],
     weights: np.ndarray | None = None,
     band: tuple[float, float] = (5, 50),
-    rms_limit: float = 5.0,
-    max_limit: float = 5.0,
-    cosine_limit: float = 0.95,
-    derivative_limit: float = 2.0,
     fan_counts: tuple[int, ...] = (5,),
-    rms_epsilon: float = 0.5,
+    max_iterations: int = 20,
+    min_reject_rate_delta: float = 0.005,
+    assign_noise_points: bool = True,
+) -> BEQResult:
+    """
+    Build BEQ composite filters via an iterative HDBSCAN clustering.
+
+    Args:
+        input_curves: Full frequency response database
+        freqs: Frequency array.
+        iteration_params: parameters for each iteration, predominantly aimed at hdbscan configuration.
+        weights: Optional frequency weights
+        band: Frequency band to analyze (min_freq, max_freq)
+        fan_counts: Number of curves in each fan level
+        max_iterations: Maximum refinement iterations
+        min_reject_rate_delta: Minimum change in reject rate to continue iterating
+        assign_noise_points: whether noise points should be considered for assignment
+
+    Returns:
+        a BEQResult object containing all cycles and final composites
+
+    Note:
+        The number of final composites is determined by HDBSCAN parameters:
+        - Increase min_cluster_size to get fewer, larger clusters
+        - Increase min_samples to get more conservative, tighter clusters
+        - Increase cluster_selection_epsilon to merge similar clusters
+    """
+    calcs: list[BEQCompositeComputation] = []
+    weights = weights if weights is not None else np.ones_like(freqs)
+    assigned_rate = 1.0
+    param_idx = 0
+    while assigned_rate >= 0.01 and param_idx < len(iteration_params):
+        if calcs:
+            entry_ids = calcs[-1].result.rejected_entry_ids
+        else:
+            entry_ids = list(range(0, input_curves.shape[0]))
+
+        input_size = len(entry_ids)
+
+        logging.info(
+            f"Running iteration {param_idx + 1} for {input_size} entries with params {iteration_params[param_idx]}"
+        )
+
+        last_calc = build_beq_composites(
+            input_curves=input_curves,
+            entry_ids=entry_ids,
+            freqs=freqs,
+            weights=weights,
+            band=band,
+            fan_counts=fan_counts,
+            hdbscan_params=iteration_params[param_idx],
+            max_iterations=max_iterations,
+            min_reject_rate_delta=min_reject_rate_delta,
+            assign_noise_points=assign_noise_points,
+        )
+        calcs.append(last_calc)
+        assigned_count = sum([a.total_assigned_count for a in calcs])
+        composite_count = sum([len(a.result.composites) for a in calcs])
+        assigned_rate = assigned_count / input_curves.shape[0]
+        logging.info(
+            f"After iteration {param_idx + 1} total assignment rate: {assigned_rate:.2%}, composites: {composite_count}"
+        )
+        param_idx += 1
+
+    result = create_final_result(calcs)
+    return result
+
+
+def build_beq_composites(
+    input_curves: np.ndarray,
+    entry_ids: list[int],
+    freqs: np.ndarray,
+    hdbscan_params: HDBSCANParams,
+    weights: np.ndarray | None = None,
+    band: tuple[float, float] = (5, 50),
+    fan_counts: tuple[int, ...] = (5,),
     max_iterations: int = 10,
     min_reject_rate_delta: float = 0.005,
-    hdbscan_min_cluster_size: int = 500,
-    hdbscan_min_samples: int | None = 50,
-    hdbscan_cluster_selection_epsilon: float = 0.0,
-    hdbscan_distance_chunk_size: int = 1000,
-    hdbscan_distance_rms_weight: float = 0.8,
-    hdbscan_distance_cosine_weight: float = 0.2,
-    hdbscan_distance_cosine_scale: float = 10.0,
-    hdbscan_use_constraints: bool = True,
-    hdbscan_distance_penalty_scale: float = 100.0,
-    hdbscan_distance_rms_undershoot_tolerance: float = 2.0,
-    hdbscan_distance_rms_close_threshold: float = 2.0,
-    hdbscan_distance_cosine_boost_in_close_range: float = 2.0,
-    hdbscan_distance_soft_limit_factor: float = 0.7,
-    hdbscan_distance_soft_penalty_scale: float = 10.0,
-    hdbscan_distance_n_jobs: int = -1,
     assign_noise_points: bool = True,
 ) -> BEQCompositeComputation:
     """
     Build BEQ composite filters using HDBSCAN clustering.
 
     Args:
-        responses_db: Full frequency response database
+        input_curves: Full frequency response database
+        entry_ids: ids of the input curves
         freqs: Frequency array
+        hdbscan_params: HDBSCAN parameters
         weights: Optional frequency weights
         band: Frequency band to analyze (min_freq, max_freq)
-        rms_limit: Maximum acceptable RMS deviation for assignment
-        max_limit: Maximum acceptable absolute deviation
-        cosine_limit: Minimum acceptable cosine similarity
-        derivative_limit: Maximum acceptable derivative RMS
         fan_counts: Number of curves in each fan level
-        rms_epsilon: Tolerance for near-minimum RMS selection
         max_iterations: Maximum refinement iterations
         min_reject_rate_delta: Minimum change in reject rate to continue iterating
-        hdbscan_min_cluster_size: Minimum cluster size for HDBSCAN (controls number of clusters)
-        hdbscan_min_samples: Minimum samples for core points (controls cluster density)
-        hdbscan_cluster_selection_epsilon: Distance threshold for merging clusters (0.0 = no merging)
-        hdbscan_distance_chunk_size: Chunk size for distance computation (lower = less memory, default 1000)
-        hdbscan_distance_rms_weight: Weight for RMS component in distance (default: 0.5)
-        hdbscan_distance_cosine_weight: Weight for cosine component in distance (default: 0.5)
-        hdbscan_distance_cosine_scale: Scaling factor for cosine to match RMS range (default: 10.0)
-        hdbscan_use_constraints: If True, penalize pairs that violate acceptance criteria (default: True)
-        hdbscan_distance_penalty_scale: Hard penalty multiplier for constraint violations (default: 100.0)
-        hdbscan_distance_rms_undershoot_tolerance: Tolerance factor for RMS undershoot (default: 2.0)
-        hdbscan_distance_rms_close_threshold: RMS threshold for cosine boosting (default: 2.0)
-        hdbscan_distance_cosine_boost_in_close_range: Cosine weight multiplier when close (default: 2.0)
-        hdbscan_distance_soft_limit_factor: Soft limit as fraction of hard limit (default: 0.7)
-        hdbscan_distance_soft_penalty_scale: Soft penalty multiplier (default: 10.0)
-        hdbscan_distance_n_jobs: Number of parallel jobs for distance computation (default: -1 = all CPUs)
-        assign_noise_points: whether noise points should be considered for assignemnt
+        assign_noise_points: whether noise points should be considered for assignment
 
     Returns:
         BEQCompositeComputation with all cycles and final composites
@@ -628,42 +766,20 @@ def build_beq_composites(
         - Increase cluster_selection_epsilon to merge similar clusters
     """
     band_mask: np.ndarray = (freqs >= band[0]) & (freqs <= band[1])
-    catalogue: np.ndarray = responses_db[:, band_mask]
+    full_masked_catalogue = input_curves[:, band_mask]
+    scoped_masked_catalogue: np.ndarray = input_curves[entry_ids][:, band_mask]
     band_weights: np.ndarray | None = (
         weights[band_mask] if weights is not None else None
     )
 
     # Step 1: HDBSCAN clustering (replaces k-medoids + Ward)
-    labels, cluster_medoids = hdbscan_clustering(
-        catalogue,
-        min_cluster_size=hdbscan_min_cluster_size,
-        min_samples=hdbscan_min_samples,
-        cluster_selection_epsilon=hdbscan_cluster_selection_epsilon,
-        distance_chunk_size=hdbscan_distance_chunk_size,
-        distance_rms_weight=hdbscan_distance_rms_weight,
-        distance_cosine_weight=hdbscan_distance_cosine_weight,
-        distance_cosine_scale=hdbscan_distance_cosine_scale,
-        distance_rms_limit=rms_limit if hdbscan_use_constraints else None,
-        distance_cosine_limit=cosine_limit if hdbscan_use_constraints else None,
-        distance_max_limit=max_limit if hdbscan_use_constraints else None,
-        distance_derivative_limit=derivative_limit if hdbscan_use_constraints else None,
-        distance_penalty_scale=hdbscan_distance_penalty_scale,
-        distance_rms_undershoot_tolerance=hdbscan_distance_rms_undershoot_tolerance,
-        distance_rms_close_threshold=hdbscan_distance_rms_close_threshold,
-        distance_cosine_boost_in_close_range=hdbscan_distance_cosine_boost_in_close_range,
-        distance_soft_limit_factor=hdbscan_distance_soft_limit_factor,
-        distance_soft_penalty_scale=hdbscan_distance_soft_penalty_scale,
-        distance_n_jobs=hdbscan_distance_n_jobs,
-    )
-
-    n_clusters = len(cluster_medoids)
-    logger.info(f"HDBSCAN found {n_clusters} natural clusters")
+    labels, cluster_medoids = hdbscan_clustering(scoped_masked_catalogue, hdbscan_params)
 
     # Step 2: Create initial composites from cluster medians
     composites: list[BEQComposite] = []
-    for cluster_id in range(n_clusters):
+    for cluster_id in range(len(cluster_medoids)):
         cluster_mask = labels == cluster_id
-        cluster_curves = catalogue[cluster_mask]
+        cluster_curves = scoped_masked_catalogue[cluster_mask]
         # Use median of cluster rather than medoid for initial composite
         composite_curve = np.median(cluster_curves, axis=0)
         composites.append(BEQComposite(cluster_id, composite_curve))
@@ -674,10 +790,10 @@ def build_beq_composites(
     n_noise = np.sum(labels == -1)
     if n_noise > 0:
         if not assign_noise_points:
-            old_cat_size = catalogue.shape[0]
-            catalogue = catalogue[labels != -1]
+            old_cat_size = scoped_masked_catalogue.shape[0]
+            scoped_masked_catalogue = scoped_masked_catalogue[labels != -1]
             logger.info(
-                f"Ignoring noise: catalogue reduced from {old_cat_size} entries to {catalogue.shape[0]}"
+                f"Ignoring noise: catalogue reduced from {old_cat_size} entries to {scoped_masked_catalogue.shape[0]}"
             )
         else:
             logger.info(
@@ -690,21 +806,21 @@ def build_beq_composites(
     prev_reject_rate: float | None = None
     for attempt in range(max_iterations):
         # Step 3: assign all entries
-        for i, entry in enumerate(catalogue):
+        for i, entry in enumerate(scoped_masked_catalogue):
             map_to_best_composite(
                 entry,
                 iterations[-1].composites,
-                rms_limit,
-                max_limit,
-                cosine_limit,
-                derivative_limit,
-                i,
+                hdbscan_params.rms_limit,
+                hdbscan_params.max_limit,
+                hdbscan_params.cosine_limit,
+                hdbscan_params.derivative_limit,
+                entry_ids[i],
                 weights=band_weights,
-                rms_epsilon=rms_epsilon,
+                rms_epsilon=hdbscan_params.distance_rms_close_threshold,
             )
 
         # Step 4: compute reject rate
-        reject_rate = iterations[-1].reject_rate(catalogue.shape[0])
+        reject_rate = iterations[-1].reject_rate(scoped_masked_catalogue.shape[0])
 
         # Halts iteration when convergence or limit reached
         if (
@@ -714,26 +830,28 @@ def build_beq_composites(
                 or reject_rate > prev_reject_rate
             )
         ) or attempt == max_iterations - 1:
+            copy_from = -2 if reject_rate > prev_reject_rate else -1
             iterations.append(
-                compute_next_cycle(catalogue, iterations[-1], copy_forward=True)
+                compute_next_cycle(full_masked_catalogue, iterations[copy_from], copy_forward=True)
             )
             break
 
         # Step 5: recompute median composite shapes for the next iteration using assigned entries only
         prev_reject_rate = reject_rate
-        iterations.append(compute_next_cycle(catalogue, iterations[-1]))
+        iterations.append(compute_next_cycle(full_masked_catalogue, iterations[-1]))
 
     # Step 6: where multiple valid mappings exist, flag all but the best as suboptimal and recompute curves
-    mark_suboptimal_mappings(catalogue, iterations)
-    compute_next_cycle(catalogue, iterations[-1], copy_forward=True)
+    mark_suboptimal_mappings(full_masked_catalogue, iterations)
+    compute_next_cycle(full_masked_catalogue, iterations[-1], copy_forward=True)
 
     # Step 7: compute fans
-    compute_fan_curves(catalogue, iterations[-1].composites, fan_counts)
+    compute_fan_curves(full_masked_catalogue, iterations[-1].composites, fan_counts)
 
-    return BEQCompositeComputation(
-        inputs=responses_db,
-        cycles=iterations,
-    )
+    computation = BEQCompositeComputation(inputs=input_curves, cycles=iterations, )
+
+    logging.info(f"Assigned {computation.total_assigned_count} entries to {len(composites)} composites")
+
+    return computation
 
 
 def mark_suboptimal_mappings(
@@ -762,10 +880,41 @@ def mark_suboptimal_mappings(
                         m.rejection_reason = RejectionReason.SUBOPTIMAL
 
 
-def merge_calculations(calcs: list[BEQCompositeComputation]) -> BEQCompositeComputation:
+def create_final_result(
+    calcs: list[BEQCompositeComputation],
+) -> BEQResult:
+    """
+    Creates a new computation that collates all the composites from each iteration into a single cycle. All catalogue
+    references are remapped to the original input catalogue correctly.
+    :param calcs: the output of each iteration.
+    :return: the original calcs with the new computation appended.
+    """
     if not calcs:
         raise ValueError("No computations to merge")
 
-    output = BEQCompositeComputation(calcs[0].inputs, None)
+    composites: list[BEQComposite] = []
+    inputs: np.ndarray | None = None
 
-    return output
+    # extract final composites from every calculation cycle into a single cycle
+    for c in calcs:
+        if inputs is None:
+            inputs = c.inputs
+            composites.extend(c.result.composites)
+        else:
+            for comp in c.result.composites:
+                comp_id = len(composites)
+                composites.append(
+                    BEQComposite(
+                        comp_id,
+                        comp.mag_response,
+                        mappings=[
+                            dataclasses.replace(m, composite_id=comp_id)
+                            for m in comp.mappings
+                        ],
+                        fan_envelopes=comp.fan_envelopes,
+                    )
+                )
+
+
+    return BEQResult(inputs, composites, calcs)
+
