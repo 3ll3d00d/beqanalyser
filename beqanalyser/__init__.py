@@ -736,6 +736,8 @@ class RejectionReason(IntEnum):
     COSINE_TOO_LOW = 4
     DERIVATIVE_TOO_HIGH = 5
     SUBOPTIMAL = 6
+    HARD_LIMIT = 7
+    NOISE = 8
 
 
 # ------------------------------
@@ -756,6 +758,7 @@ class BEQFilterMapping:
     max_delta: float
     derivative_delta: float
     cosine_similarity: float
+    distance_score: float
     rejection_reason: RejectionReason | None = None
     is_best: bool = False
 
@@ -883,6 +886,9 @@ class BEQResult:
     def input_size(self) -> int:
         return self.inputs.shape[0]
 
+    @property
+    def assigned_entry_ids(self) -> set[int]:
+        return set([e for c in self.composites for e in c.assigned_entry_ids])
 
 # ------------------------------
 # Helper functions

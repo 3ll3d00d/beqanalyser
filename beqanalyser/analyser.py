@@ -2,7 +2,7 @@ import copy
 import dataclasses
 import logging
 import time
-from dataclasses import dataclass, fields, MISSING
+from dataclasses import MISSING, dataclass, fields
 from multiprocessing import Pool, cpu_count
 from typing import Any
 
@@ -14,17 +14,18 @@ from beqanalyser import (
     BEQComposite,
     BEQCompositeComputation,
     BEQFilterMapping,
+    BEQResult,
     ComputationCycle,
     RejectionReason,
     cosine_similarity,
     derivative_rms,
-    rms, BEQResult,
+    rms,
 )
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass(slots=True, repr=True)
+@dataclass(slots=True, repr=False)
 class HDBSCANParams:
     """
     Configuration parameters for HDBSCAN-based clustering and custom
@@ -156,6 +157,263 @@ class HDBSCANParams:
 # ------------------------------
 # Precompute distance matrix for BEQ curves
 # ------------------------------
+def _compute_distance_components(
+    rms_vals: np.ndarray | float,
+    cos_sim_vals: np.ndarray | float,
+    max_vals: np.ndarray | float,
+    deriv_vals: np.ndarray | float | None,
+    mean_diff_vals: np.ndarray | float,
+    hdbscan_params: HDBSCANParams,
+) -> np.ndarray | float:
+    """
+    Core distance computation logic shared between matrix and single-pair calculations.
+
+    Computes sophisticated distance scores with:
+    - Asymmetric RMS handling (tolerant to undershoot)
+    - Adaptive cosine weighting (boosted when RMS is close)
+    - Tiered penalty system (soft/hard limits)
+
+    Args:
+        rms_vals: RMS distance values (can be scalar or array)
+        cos_sim_vals: Cosine similarity values (can be scalar or array)
+        max_vals: Maximum absolute deviation values (can be scalar or array)
+        deriv_vals: Derivative RMS values (can be scalar or array, or None)
+        mean_diff_vals: Mean difference values for undershoot detection (can be scalar or array)
+        hdbscan_params: Parameters controlling distance computation
+
+    Returns:
+        Distance scores (same shape as input arrays)
+    """
+    # Convert cosine similarity to distance
+    cos_dist = 1.0 - cos_sim_vals
+
+    # 1. Asymmetric RMS handling
+    is_undershoot = mean_diff_vals < 0
+    rms_adjusted = rms_vals
+
+    if hdbscan_params.distance_rms_undershoot_tolerance > 1.0:
+        undershoot_factor = 1.0 / hdbscan_params.distance_rms_undershoot_tolerance
+        if isinstance(rms_vals, np.ndarray):
+            rms_adjusted = np.where(
+                is_undershoot, rms_vals * undershoot_factor, rms_vals
+            )
+        elif is_undershoot:
+            rms_adjusted = rms_vals * undershoot_factor
+
+    # 2. Detect "close" RMS range and boost cosine weight
+    is_close = rms_vals < hdbscan_params.distance_rms_close_threshold
+    if isinstance(is_close, np.ndarray):
+        cosine_weight_adjusted = np.where(
+            is_close,
+            hdbscan_params.distance_cosine_weight
+            * hdbscan_params.distance_cosine_boost_in_close_range,
+            hdbscan_params.distance_cosine_weight,
+        )
+    else:
+        cosine_weight_adjusted = (
+            hdbscan_params.distance_cosine_weight
+            * hdbscan_params.distance_cosine_boost_in_close_range
+            if is_close
+            else hdbscan_params.distance_cosine_weight
+        )
+
+    # Compute base distance with adaptive weighting
+    base_distance = (
+        hdbscan_params.distance_rms_weight * rms_adjusted
+        + cosine_weight_adjusted * cos_dist * hdbscan_params.distance_cosine_scale
+    )
+
+    # 3. Tiered penalty system
+    if isinstance(base_distance, np.ndarray):
+        penalty = np.zeros_like(base_distance, dtype=np.float32)
+    else:
+        penalty = 0.0
+
+    if hdbscan_params.use_constraints:
+        # RMS penalties
+        if hdbscan_params.rms_limit is not None:
+            soft_rms = (
+                hdbscan_params.rms_limit * hdbscan_params.distance_soft_limit_factor
+            )
+
+            # Soft penalty zone
+            soft_violations = (rms_vals > soft_rms) & (
+                rms_vals <= hdbscan_params.rms_limit
+            )
+            if isinstance(soft_violations, np.ndarray):
+                penalty = (
+                    penalty
+                    + soft_violations.astype(np.float32)
+                    * hdbscan_params.distance_soft_penalty_scale
+                )
+            elif soft_violations:
+                penalty = penalty + hdbscan_params.distance_soft_penalty_scale
+
+            # Hard penalty zone with asymmetric handling
+            hard_violations_overshoot = (
+                rms_vals > hdbscan_params.rms_limit
+            ) & ~is_undershoot
+            if isinstance(hard_violations_overshoot, np.ndarray):
+                penalty = (
+                    penalty
+                    + hard_violations_overshoot.astype(np.float32)
+                    * hdbscan_params.distance_penalty_scale
+                )
+            elif hard_violations_overshoot:
+                penalty = penalty + hdbscan_params.distance_penalty_scale
+
+            # Reduced penalty for undershoot violations
+            hard_violations_undershoot = (
+                rms_vals > hdbscan_params.rms_limit
+            ) & is_undershoot
+            reduced_penalty = (
+                hdbscan_params.distance_penalty_scale
+                / hdbscan_params.distance_rms_undershoot_tolerance
+            )
+            if isinstance(hard_violations_undershoot, np.ndarray):
+                penalty = (
+                    penalty
+                    + hard_violations_undershoot.astype(np.float32) * reduced_penalty
+                )
+            elif hard_violations_undershoot:
+                penalty = penalty + reduced_penalty
+
+        # Cosine penalties
+        if hdbscan_params.cosine_limit is not None:
+            soft_cos = hdbscan_params.cosine_limit + (
+                1.0 - hdbscan_params.cosine_limit
+            ) * (1.0 - hdbscan_params.distance_soft_limit_factor)
+
+            # Soft penalty zone
+            soft_violations = (cos_sim_vals < soft_cos) & (
+                cos_sim_vals >= hdbscan_params.cosine_limit
+            )
+            if isinstance(soft_violations, np.ndarray):
+                penalty = (
+                    penalty
+                    + soft_violations.astype(np.float32)
+                    * hdbscan_params.distance_soft_penalty_scale
+                )
+            elif soft_violations:
+                penalty = penalty + hdbscan_params.distance_soft_penalty_scale
+
+            # Hard penalty zone
+            hard_violations = cos_sim_vals < hdbscan_params.cosine_limit
+            if isinstance(hard_violations, np.ndarray):
+                penalty = (
+                    penalty
+                    + hard_violations.astype(np.float32)
+                    * hdbscan_params.distance_penalty_scale
+                )
+            elif hard_violations:
+                penalty = penalty + hdbscan_params.distance_penalty_scale
+
+        # Max deviation penalties
+        if hdbscan_params.max_limit is not None:
+            soft_max = (
+                hdbscan_params.max_limit * hdbscan_params.distance_soft_limit_factor
+            )
+
+            # Soft penalty zone
+            soft_violations = (max_vals > soft_max) & (
+                max_vals <= hdbscan_params.max_limit
+            )
+            if isinstance(soft_violations, np.ndarray):
+                penalty = (
+                    penalty
+                    + soft_violations.astype(np.float32)
+                    * hdbscan_params.distance_soft_penalty_scale
+                )
+            elif soft_violations:
+                penalty = penalty + hdbscan_params.distance_soft_penalty_scale
+
+            # Hard penalty zone
+            hard_violations = max_vals > hdbscan_params.max_limit
+            if isinstance(hard_violations, np.ndarray):
+                penalty = (
+                    penalty
+                    + hard_violations.astype(np.float32)
+                    * hdbscan_params.distance_penalty_scale
+                )
+            elif hard_violations:
+                penalty = penalty + hdbscan_params.distance_penalty_scale
+
+        # Derivative penalties
+        if hdbscan_params.derivative_limit is not None and deriv_vals is not None:
+            soft_deriv = (
+                hdbscan_params.derivative_limit
+                * hdbscan_params.distance_soft_limit_factor
+            )
+
+            # Soft penalty zone
+            soft_violations = (deriv_vals > soft_deriv) & (
+                deriv_vals <= hdbscan_params.derivative_limit
+            )
+            if isinstance(soft_violations, np.ndarray):
+                penalty = (
+                    penalty
+                    + soft_violations.astype(np.float32)
+                    * hdbscan_params.distance_soft_penalty_scale
+                )
+            elif soft_violations:
+                penalty = penalty + hdbscan_params.distance_soft_penalty_scale
+
+            # Hard penalty zone
+            hard_violations = deriv_vals > hdbscan_params.derivative_limit
+            if isinstance(hard_violations, np.ndarray):
+                penalty = (
+                    penalty
+                    + hard_violations.astype(np.float32)
+                    * hdbscan_params.distance_penalty_scale
+                )
+            elif hard_violations:
+                penalty = penalty + hdbscan_params.distance_penalty_scale
+
+    # Combine base distance with penalties
+    return base_distance + penalty
+
+
+def compute_composite_distance(
+    entry: np.ndarray,
+    composite: np.ndarray,
+    hdbscan_params: HDBSCANParams,
+    weights: np.ndarray | None = None,
+) -> tuple[float, float, float, float, float]:
+    """
+    Compute sophisticated distance score for a single entry-composite pair.
+
+    Uses the same logic as compute_beq_distance_matrix for consistency.
+
+    Args:
+        entry: Input curve to compare
+        composite: Composite curve to compare against
+        hdbscan_params: Parameters controlling distance computation
+        weights: Optional frequency weights for RMS calculation
+
+    Returns:
+        Tuple of (distance_score, rms_delta, max_delta, cosine_similarity, derivative_delta)
+    """
+    # Compute basic metrics
+    delta = entry - composite
+    rms_delta = rms(delta, weights)
+    max_delta = float(np.max(np.abs(delta)))
+    cos_sim = cosine_similarity(entry, composite)
+    deriv_delta = derivative_rms(delta)
+    mean_diff = float(np.mean(delta))
+
+    # Use common distance computation logic
+    distance_score = _compute_distance_components(
+        rms_vals=rms_delta,
+        cos_sim_vals=cos_sim,
+        max_vals=max_delta,
+        deriv_vals=deriv_delta,
+        mean_diff_vals=mean_diff,
+        hdbscan_params=hdbscan_params,
+    )
+
+    return float(distance_score), rms_delta, max_delta, cos_sim, deriv_delta
+
+
 def _compute_distance_chunk(args):
     """
     Worker function for parallel distance computation.
@@ -335,85 +593,43 @@ def compute_beq_distance_matrix(
     b = time.time()
     logger.info(f"Computed base distances in {b - a:.3f}s")
 
-    # Assemble results and compute sophisticated distance
+    # Create HDBSCANParams object for distance computation
+    temp_params = HDBSCANParams(
+        rms_limit=rms_limit,
+        cosine_limit=cosine_limit,
+        max_limit=max_limit,
+        derivative_limit=derivative_limit,
+        distance_rms_weight=rms_weight,
+        distance_cosine_weight=cosine_weight,
+        distance_cosine_scale=cosine_scale,
+        distance_penalty_scale=penalty_scale,
+        distance_rms_undershoot_tolerance=rms_undershoot_tolerance,
+        distance_rms_close_threshold=rms_close_threshold,
+        distance_cosine_boost_in_close_range=cosine_boost_in_close_range,
+        distance_soft_limit_factor=soft_limit_factor,
+        distance_soft_penalty_scale=soft_penalty_scale,
+        use_constraints=True
+        if (rms_limit or cosine_limit or max_limit or derivative_limit)
+        else False,
+    )
+
+    # Assemble results using common distance computation logic
     logger.debug("Assembling distance matrix with sophisticated penalties...")
 
     for i, end_i, rms_row, cos_row, max_row, deriv_row in results:
-        n_rows = end_i - i
-
-        # Convert cosine similarity to distance
-        cos_dist = 1.0 - cos_row
-
-        # 1. Asymmetric RMS handling
-        # For each pair, check if it undershoots or overshoots
-        # Undershoot: curve i is lower than curve j (negative mean difference)
+        # Compute mean difference for undershoot detection
         mean_diff = np.mean(X_float32[i:end_i, None, :] - X_float32[None, :, :], axis=2)
-        is_undershoot = mean_diff < 0
 
-        # Apply tolerance to undershoot
-        rms_adjusted = rms_row.copy()
-        if rms_undershoot_tolerance > 1.0:
-            undershoot_factor = 1.0 / rms_undershoot_tolerance
-            rms_adjusted = np.where(is_undershoot, rms_row * undershoot_factor, rms_row)
-
-        # 2. Detect "close" RMS range and boost cosine weight
-        is_close = rms_row < rms_close_threshold
-        cosine_weight_adjusted = np.where(
-            is_close, cosine_weight * cosine_boost_in_close_range, cosine_weight
-        )
-
-        # Compute base distance with adaptive weighting
-        base_distance = (
-            rms_weight * rms_adjusted + cosine_weight_adjusted * cos_dist * cosine_scale
-        )
-
-        # 3. Tiered penalty system
-        penalty = np.zeros((n_rows, n_samples), dtype=np.float32)
-
-        if rms_limit is not None:
-            soft_rms = soft_limits["rms"]
-            # Soft penalty zone
-            soft_violations = (rms_row > soft_rms) & (rms_row <= rms_limit)
-            penalty += soft_violations.astype(np.float32) * soft_penalty_scale
-            # Hard penalty zone (overshoot only - undershoot gets tolerance)
-            hard_violations = (rms_row > rms_limit) & ~is_undershoot
-            penalty += hard_violations.astype(np.float32) * penalty_scale
-            # Undershoot hard violations get a reduced penalty
-            hard_undershoot = (rms_row > rms_limit) & is_undershoot
-            penalty += hard_undershoot.astype(np.float32) * (
-                penalty_scale / rms_undershoot_tolerance
-            )
-
-        if cosine_limit is not None:
-            soft_cos = soft_limits["cosine"]
-            cos_sim = 1.0 - cos_dist
-            # Soft penalty zone
-            soft_violations = (cos_sim < soft_cos) & (cos_sim >= cosine_limit)
-            penalty += soft_violations.astype(np.float32) * soft_penalty_scale
-            # Hard penalty zone
-            hard_violations = cos_sim < cosine_limit
-            penalty += hard_violations.astype(np.float32) * penalty_scale
-
-        if max_limit is not None:
-            soft_max = soft_limits["max"]
-            # Soft penalty zone
-            soft_violations = (max_row > soft_max) & (max_row <= max_limit)
-            penalty += soft_violations.astype(np.float32) * soft_penalty_scale
-            # Hard penalty zone
-            hard_violations = max_row > max_limit
-            penalty += hard_violations.astype(np.float32) * penalty_scale
-
-        if derivative_limit is not None and deriv_row is not None:
-            soft_deriv = soft_limits["derivative"]
-            # Soft penalty zone
-            soft_violations = (deriv_row > soft_deriv) & (deriv_row <= derivative_limit)
-            penalty += soft_violations.astype(np.float32) * soft_penalty_scale
-            # Hard penalty zone
-            hard_violations = deriv_row > derivative_limit
-            penalty += hard_violations.astype(np.float32) * penalty_scale
-
-        # Combine base distance with penalties
-        distance_matrix[i:end_i, :] = (base_distance + penalty).astype(np.float64)
+        # Use common distance computation logic
+        # Note: cos_row contains cosine SIMILARITY (not distance)
+        distance_matrix[i:end_i, :] = _compute_distance_components(
+            rms_vals=rms_row,
+            cos_sim_vals=cos_row,  # cos_row already contains similarity
+            max_vals=max_row,
+            deriv_vals=deriv_row,
+            mean_diff_vals=mean_diff,
+            hdbscan_params=temp_params,
+        ).astype(np.float64)
 
         logger.debug(f"  Processed {end_i}/{n_samples} rows")
 
@@ -533,66 +749,196 @@ def hdbscan_clustering(
 def map_to_best_composite(
     entry: np.ndarray,
     composites: list[BEQComposite],
-    rms_limit: float,
-    max_limit: float,
-    cosine_limit: float,
-    derivative_limit: float,
+    hdbscan_params: HDBSCANParams,
     entry_id: int,
+    cluster_label: int,
     weights: np.ndarray | None = None,
-    rms_epsilon: float = 1.0,
 ) -> None:
     """
-    Assign entry to composites using two-stage selection:
-    1. Find composites within rms_epsilon of minimum RMS
-    2. Among those, select the one with highest cosine similarity
+    Assign entry to composites using the distance score from compute_beq_distance_matrix.
+
+    The composite with the lowest distance score is selected as best. Entries are rejected
+    if their distance score indicates hard limit violations (determined by penalty thresholds),
+    otherwise all others are marked as suboptimal.
 
     Args:
         entry: Input curve to assign
         composites: List of composite candidates
-        rms_limit: Maximum acceptable RMS deviation
-        max_limit: Maximum acceptable absolute deviation
-        cosine_limit: Minimum acceptable cosine similarity
-        derivative_limit: Maximum acceptable derivative RMS
+        hdbscan_params: Parameters controlling distance computation and limits
         entry_id: Index of entry in catalogue
+        cluster_label: Cluster label assigned by HDBSCAN, -1 if identified as noise
         weights: Optional frequency weights for RMS calculation
-        rms_epsilon: Tolerance for selecting near-minimum RMS composites
-
     """
-    # Store all composite evaluations
-    mappings: list[BEQFilterMapping] = []
+    composite_scores: list[tuple[float, BEQFilterMapping]] = []
+
+    # Define the rejection threshold based on hard penalties
+    # If the distance score includes hard penalties, it indicates constraint violations
+    rejection_threshold = (
+        hdbscan_params.distance_penalty_scale
+        if hdbscan_params.use_constraints
+        else float("inf")
+    )
 
     for comp in composites:
-        delta = entry - comp.mag_response
+        distance_score, rms_delta, max_delta, cos_sim, deriv_delta = (
+            compute_composite_distance(
+                entry, comp.mag_response, hdbscan_params, weights
+            )
+        )
+
         mapping = BEQFilterMapping(
             composite_id=comp.id,
             entry_id=entry_id,
-            rms_delta=rms(delta, weights),
-            max_delta=float(np.max(np.abs(delta))),
-            derivative_delta=derivative_rms(delta),
-            cosine_similarity=cosine_similarity(entry, comp.mag_response),
+            rms_delta=rms_delta,
+            max_delta=max_delta,
+            derivative_delta=deriv_delta,
+            cosine_similarity=cos_sim,
+            distance_score=distance_score,
         )
-        mapping.assess(rms_limit, max_limit, cosine_limit, derivative_limit)
-        mappings.append(mapping)
+
+        # Reject if the distance score indicates a hard limit violation or if it was already identified as noise
+        if cluster_label == -1:
+            mapping.rejection_reason = RejectionReason.NOISE
+        elif distance_score >= rejection_threshold:
+            mapping.rejection_reason = RejectionReason.HARD_LIMIT
+
+        composite_scores.append((distance_score, mapping))
         comp.mappings.append(mapping)
 
-    # Find minimum RMS
-    min_rms = min(m.rms_delta for m in mappings)
+    # Find the composite with the minimum distance score and mark it as best
+    best_score, best_mapping = min(composite_scores, key=lambda x: x[0])
+    best_mapping.is_best = True
 
-    # Filter composites within epsilon of minimum RMS
-    candidates = [m for m in mappings if m.rms_delta <= min_rms + rms_epsilon]
+    # Mark all others as suboptimal
+    for distance_score, mapping in composite_scores:
+        if mapping.composite_id != best_mapping.composite_id and not mapping.rejected:
+            mapping.rejection_reason = RejectionReason.SUBOPTIMAL
 
-    # Among candidates, select the candidate with the highest cosine similarity
-    best_metrics = (
-        max(candidates, key=lambda m: m.cosine_similarity) if candidates else None
+    best_composites = [
+        c
+        for c in composites
+        if any(m.is_best is True for m in c.mappings if m.entry_id == entry_id)
+    ]
+    assert len(best_composites) == 1, (
+        f"Expected 1 best mapping, got {len(best_composites)}"
     )
 
-    # flag all other composites as suboptimal unless already rejected
-    for mapping in mappings:
-        if best_metrics and mapping.composite_id != best_metrics.composite_id:
-            if not mapping.rejected:
-                mapping.rejection_reason = RejectionReason.SUBOPTIMAL
-        else:
-            mapping.is_best = True
+
+def assign_remaining_entries(
+    input_curves: np.ndarray,
+    remaining_entry_ids: list[int],
+    all_composites: list[BEQComposite],
+    freqs: np.ndarray,
+    hdbscan_params: HDBSCANParams,
+    weights: np.ndarray | None = None,
+    band: tuple[float, float] = (5, 50),
+    distance_threshold_multiplier: float = 1.5,
+) -> tuple[int, int]:
+    """
+    Attempt to assign remaining rejected/noise entries to discovered composites.
+
+    This is the final assignment phase that runs after all cluster discovery iterations.
+    It uses a relaxed distance threshold to catch "near-miss" outliers while still
+    rejecting true outliers that don't fit any discovered pattern.
+
+    Args:
+        input_curves: Full frequency response database
+        remaining_entry_ids: Entry IDs that were not assigned during clustering
+        all_composites: All composites discovered across all iterations
+        freqs: Frequency array
+        hdbscan_params: Base parameters for distance computation
+        weights: Optional frequency weights
+        band: Frequency band to analyze
+        distance_threshold_multiplier: Multiplier for acceptable distance threshold.
+            Values > 1.0 allow more lenient assignment of outliers.
+
+    Returns:
+        Tuple of (newly_assigned_count, still_rejected_count)
+    """
+    if not remaining_entry_ids or not all_composites:
+        return 0, len(remaining_entry_ids) if remaining_entry_ids else 0
+
+    band_mask = (freqs >= band[0]) & (freqs <= band[1])
+    masked_catalogue = input_curves[:, band_mask]
+    band_weights = weights[band_mask] if weights is not None else None
+
+    logger.info(
+        f"Attempting final assignment of {len(remaining_entry_ids)} remaining entries "
+        f"to {len(all_composites)} composites with threshold multiplier {distance_threshold_multiplier}"
+    )
+
+    # Create relaxed parameters for final assignment
+    relaxed_params = copy.deepcopy(hdbscan_params)
+    if relaxed_params.rms_limit is not None:
+        relaxed_params.rms_limit *= distance_threshold_multiplier
+    if relaxed_params.max_limit is not None:
+        relaxed_params.max_limit *= distance_threshold_multiplier
+    if relaxed_params.derivative_limit is not None:
+        relaxed_params.derivative_limit *= distance_threshold_multiplier
+    if relaxed_params.cosine_limit is not None:
+        # For cosine, move threshold toward more lenient (lower value)
+        relaxed_params.cosine_limit = max(
+            0.0,
+            relaxed_params.cosine_limit
+            - (1.0 - relaxed_params.cosine_limit)
+            * (distance_threshold_multiplier - 1.0),
+        )
+
+    # Rejection threshold for relaxed parameters
+    rejection_threshold = (
+        relaxed_params.distance_penalty_scale
+        if relaxed_params.use_constraints
+        else float("inf")
+    )
+
+    newly_assigned = 0
+    still_rejected = 0
+
+    for entry_id in remaining_entry_ids:
+        entry = masked_catalogue[entry_id]
+
+        # Compute distance to all composites
+        best_distance = float("inf")
+        best_composite = None
+        best_mapping = None
+
+        for comp in all_composites:
+            distance_score, rms_delta, max_delta, cos_sim, deriv_delta = (
+                compute_composite_distance(
+                    entry, comp.mag_response, relaxed_params, band_weights
+                )
+            )
+
+            if distance_score < best_distance:
+                best_distance = distance_score
+                best_composite = comp
+                best_mapping = BEQFilterMapping(
+                    composite_id=comp.id,
+                    entry_id=entry_id,
+                    rms_delta=rms_delta,
+                    max_delta=max_delta,
+                    derivative_delta=deriv_delta,
+                    cosine_similarity=cos_sim,
+                    distance_score=distance_score,
+                )
+
+        # Check if rejected based on distance score
+        if best_mapping:
+            if best_distance >= rejection_threshold:
+                best_mapping.rejection_reason = RejectionReason.HARD_LIMIT
+                still_rejected += 1
+            else:
+                best_mapping.is_best = True
+                newly_assigned += 1
+
+            best_composite.mappings.append(best_mapping)
+
+    logger.info(
+        f"Final assignment: {newly_assigned} newly assigned, {still_rejected} still rejected "
+        f"({100.0 * newly_assigned / len(remaining_entry_ids):.1f}% success rate)"
+    )
+
+    return newly_assigned, still_rejected
 
 
 # ------------------------------
@@ -654,6 +1000,7 @@ def compute_fan_curves(
 # ------------------------------
 # Full pipeline
 # ------------------------------
+# Update build_all_composites to use the new approach
 def build_all_composites(
     input_curves: np.ndarray,
     freqs: np.ndarray,
@@ -663,21 +1010,28 @@ def build_all_composites(
     fan_counts: tuple[int, ...] = (5,),
     max_iterations: int = 20,
     min_reject_rate_delta: float = 0.005,
-    assign_noise_points: bool = True,
+    final_assignment_threshold_multiplier: float = 1.5,
 ) -> BEQResult:
     """
-    Build BEQ composite filters via an iterative HDBSCAN clustering.
+    Build BEQ composite filters via an iterative HDBSCAN clustering with final assignment phase.
+
+    This function operates in two phases:
+    1. Discovery Phase: Iteratively run HDBSCAN, keeping noise points as rejected to allow
+       them to form clusters in subsequent iterations.
+    2. Assignment Phase: After all clusters discovered, attempt to assign remaining rejected
+       entries to the best-matching composite using relaxed distance thresholds.
 
     Args:
         input_curves: Full frequency response database
         freqs: Frequency array.
         iteration_params: parameters for each iteration, predominantly aimed at hdbscan configuration.
         weights: Optional frequency weights
-        band: Frequency band to analyze (min_freq, max_freq)
+        band: Frequency band to analyse (min_freq, max_freq)
         fan_counts: Number of curves in each fan level
-        max_iterations: Maximum refinement iterations
+        max_iterations: Maximum refinement iterations per HDBSCAN run
         min_reject_rate_delta: Minimum change in reject rate to continue iterating
-        assign_noise_points: whether noise points should be considered for assignment
+        final_assignment_threshold_multiplier: Multiplier for the distance threshold in final assignment.
+            Values > 1.0 allow more lenient assignment of outliers (default: 1.5).
 
     Returns:
         a BEQResult object containing all cycles and final composites
@@ -692,15 +1046,23 @@ def build_all_composites(
     weights = weights if weights is not None else np.ones_like(freqs)
     assigned_rate = 1.0
     param_idx = 0
+
+    all_entry_ids = list(range(0, input_curves.shape[0]))
+
+    # Phase 1: Discovery - iteratively find clusters, keep noise as rejected
+    logger.info("=" * 80)
+    logger.info("PHASE 1: CLUSTER DISCOVERY (noise points kept as rejected)")
+    logger.info("=" * 80)
+
     while assigned_rate >= 0.01 and param_idx < len(iteration_params):
         if calcs:
             entry_ids = calcs[-1].result.rejected_entry_ids
         else:
-            entry_ids = list(range(0, input_curves.shape[0]))
+            entry_ids = all_entry_ids
 
         input_size = len(entry_ids)
 
-        logging.info(
+        logger.info(
             f"Running iteration {param_idx + 1} for {input_size} entries with params {iteration_params[param_idx]}"
         )
 
@@ -714,18 +1076,67 @@ def build_all_composites(
             hdbscan_params=iteration_params[param_idx],
             max_iterations=max_iterations,
             min_reject_rate_delta=min_reject_rate_delta,
-            assign_noise_points=assign_noise_points,
+            assign_noise_points=False,  # Keep noise as rejected during discovery
         )
         calcs.append(last_calc)
         assigned_count = sum([a.total_assigned_count for a in calcs])
         composite_count = sum([len(a.result.composites) for a in calcs])
         assigned_rate = assigned_count / input_curves.shape[0]
-        logging.info(
+        logger.info(
             f"After iteration {param_idx + 1} total assignment rate: {assigned_rate:.2%}, composites: {composite_count}"
         )
         param_idx += 1
 
+    # Phase 2: Final assignment of remaining entries
+    logger.info("")
+    logger.info("=" * 80)
+    logger.info("PHASE 2: FINAL ASSIGNMENT (attempt to map remaining entries)")
+    logger.info("=" * 80)
+
     result = create_final_result(calcs)
+    assigned_ids = result.assigned_entry_ids
+    remaining_ids = set(all_entry_ids) - assigned_ids
+    if remaining_ids and final_assignment_threshold_multiplier > 0:
+        # Use the last (most lenient) iteration params for final assignment
+        final_params = iteration_params[-1] if iteration_params else HDBSCANParams()
+
+        newly_assigned, still_rejected = assign_remaining_entries(
+            input_curves=input_curves,
+            remaining_entry_ids=list(remaining_ids),
+            all_composites=result.composites,
+            freqs=freqs,
+            hdbscan_params=final_params,
+            weights=weights,
+            band=band,
+            distance_threshold_multiplier=final_assignment_threshold_multiplier,
+        )
+        logger.info(
+            f"Remaining entry assignment results: {newly_assigned} newly assigned, {still_rejected} still rejected"
+        )
+
+        if newly_assigned > 0:
+            # Recompute composite curves with newly assigned entries
+            band_mask = (freqs >= band[0]) & (freqs <= band[1])
+            masked_catalogue = input_curves[:, band_mask]
+
+            for comp in result.composites:
+                if comp.assigned_entry_ids:
+                    assigned = masked_catalogue[comp.assigned_entry_ids, :]
+                    comp.mag_response = np.median(assigned, axis=0)
+
+            # Recompute fan curves
+            compute_fan_curves(masked_catalogue, result.composites, fan_counts)
+
+        # Update result statistics
+        total_assigned = sum(len(c.assigned_entry_ids) for c in result.composites)
+        final_rate = total_assigned / input_curves.shape[0]
+        logger.info(
+            f"Final assignment rate: {final_rate:.2%} "
+            f"({total_assigned}/{input_curves.shape[0]} entries assigned)"
+        )
+    else:
+        logger.info("No remaining entries to assign or final assignment disabled")
+
     return result
 
 
@@ -773,7 +1184,9 @@ def build_beq_composites(
     )
 
     # Step 1: HDBSCAN clustering (replaces k-medoids + Ward)
-    labels, cluster_medoids = hdbscan_clustering(scoped_masked_catalogue, hdbscan_params)
+    labels, cluster_medoids = hdbscan_clustering(
+        scoped_masked_catalogue, hdbscan_params
+    )
 
     # Step 2: Create initial composites from cluster medians
     composites: list[BEQComposite] = []
@@ -788,12 +1201,12 @@ def build_beq_composites(
 
     # Log initial cluster statistics
     n_noise = np.sum(labels == -1)
+    in_scope_catalogue_size = scoped_masked_catalogue[labels != -1].shape[0]
     if n_noise > 0:
         if not assign_noise_points:
             old_cat_size = scoped_masked_catalogue.shape[0]
-            scoped_masked_catalogue = scoped_masked_catalogue[labels != -1]
             logger.info(
-                f"Ignoring noise: catalogue reduced from {old_cat_size} entries to {scoped_masked_catalogue.shape[0]}"
+                f"Ignoring noise: catalogue reduced from {old_cat_size} entries to {in_scope_catalogue_size}"
             )
         else:
             logger.info(
@@ -803,81 +1216,64 @@ def build_beq_composites(
         logger.info("No noise points found, entire catalogue will be assigned")
 
     # iterate until the rejection rate stops improving
-    prev_reject_rate: float | None = None
+    prev_reject_rate: float = 100.0
     for attempt in range(max_iterations):
         # Step 3: assign all entries
         for i, entry in enumerate(scoped_masked_catalogue):
             map_to_best_composite(
                 entry,
                 iterations[-1].composites,
-                hdbscan_params.rms_limit,
-                hdbscan_params.max_limit,
-                hdbscan_params.cosine_limit,
-                hdbscan_params.derivative_limit,
+                hdbscan_params,
                 entry_ids[i],
+                labels[i],
                 weights=band_weights,
-                rms_epsilon=hdbscan_params.distance_rms_close_threshold,
             )
 
         # Step 4: compute reject rate
-        reject_rate = iterations[-1].reject_rate(scoped_masked_catalogue.shape[0])
+        reject_rate = iterations[-1].reject_rate(in_scope_catalogue_size)
 
         # Halts iteration when convergence or limit reached
         if (
-            prev_reject_rate is not None
-            and (
+            (
                 abs(prev_reject_rate - reject_rate) <= min_reject_rate_delta
                 or reject_rate > prev_reject_rate
             )
-        ) or attempt == max_iterations - 1:
-            copy_from = -2 if reject_rate > prev_reject_rate else -1
-            iterations.append(
-                compute_next_cycle(full_masked_catalogue, iterations[copy_from], copy_forward=True)
-            )
+            or attempt == max_iterations - 1
+            or reject_rate == 0.0
+        ):
+            if len(iterations) > 1:
+                copy_from = -2 if reject_rate > prev_reject_rate else -1
+                iterations.append(
+                    compute_next_cycle(
+                        full_masked_catalogue, iterations[copy_from], copy_forward=True
+                    )
+                )
             break
 
         # Step 5: recompute median composite shapes for the next iteration using assigned entries only
         prev_reject_rate = reject_rate
         iterations.append(compute_next_cycle(full_masked_catalogue, iterations[-1]))
 
-    # Step 6: where multiple valid mappings exist, flag all but the best as suboptimal and recompute curves
-    mark_suboptimal_mappings(full_masked_catalogue, iterations)
-    compute_next_cycle(full_masked_catalogue, iterations[-1], copy_forward=True)
-
-    # Step 7: compute fans
+    # Step 6: compute fans
     compute_fan_curves(full_masked_catalogue, iterations[-1].composites, fan_counts)
 
-    computation = BEQCompositeComputation(inputs=input_curves, cycles=iterations, )
+    computation = BEQCompositeComputation(
+        inputs=input_curves,
+        cycles=iterations,
+    )
 
-    logging.info(f"Assigned {computation.total_assigned_count} entries to {len(composites)} composites")
+    logging.info(
+        f"Entries: {scoped_masked_catalogue.shape[0]}, in scope: {in_scope_catalogue_size}, composites: {len(composites)}, assigned: {computation.total_assigned_count}, rejected {computation.total_rejected_count}"
+    )
+
+    delta = (
+        scoped_masked_catalogue.shape[0]
+        - computation.total_assigned_count
+        - computation.total_rejected_count
+    )
+    assert delta == 0, f"Delta should be 0, got {delta}"
 
     return computation
-
-
-def mark_suboptimal_mappings(
-    catalogue: ndarray[tuple[Any, ...], dtype[Any]], iterations: list[ComputationCycle]
-):
-    # isolate "best" mappings for cases where a filter can be mapped to multiple composites
-    from collections import defaultdict
-
-    mappings_by_entry_id: dict[int, list[BEQFilterMapping]] = defaultdict(list)
-    for c in iterations[-1].composites:
-        for m in c.mappings:
-            if not m.rejected:
-                mappings_by_entry_id[m.entry_id].append(m)
-    if mappings_by_entry_id and any(
-        len(mappings) > 1 for mappings in mappings_by_entry_id.values()
-    ):
-        iterations.append(
-            compute_next_cycle(catalogue, iterations[-1], copy_forward=True)
-        )
-        for entry_id, mappings in mappings_by_entry_id.items():
-            # Convert non‑optimal mappings to rejected
-            if len(mappings) > 1:
-                best_mapping_by_rms_delta = min(mappings, key=lambda m: m.rms_delta)
-                for m in mappings:
-                    if m.composite_id != best_mapping_by_rms_delta.composite_id:
-                        m.rejection_reason = RejectionReason.SUBOPTIMAL
 
 
 def create_final_result(
@@ -915,6 +1311,4 @@ def create_final_result(
                     )
                 )
 
-
     return BEQResult(inputs, composites, calcs)
-
