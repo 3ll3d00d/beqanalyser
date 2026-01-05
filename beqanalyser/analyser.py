@@ -4,11 +4,9 @@ import logging
 import time
 from dataclasses import MISSING, dataclass, fields
 from multiprocessing import Pool, cpu_count
-from typing import Any
 
 import hdbscan
 import numpy as np
-from numpy import dtype, ndarray
 
 from beqanalyser import (
     BEQComposite,
@@ -658,43 +656,61 @@ def compute_beq_distance_matrix(
 def hdbscan_clustering(
     X: np.ndarray,
     hdbscan_params: HDBSCANParams,
-) -> tuple[np.ndarray, np.ndarray]:
+    precomputed_distance_matrix: np.ndarray | None = None,
+    entry_indices: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Use HDBSCAN to identify natural cluster structure directly.
 
     Args:
         X: Input data matrix (n_samples, n_features)
         hdbscan_params: HDBSCAN parameters
+        precomputed_distance_matrix: Optional precomputed full distance matrix
+        entry_indices: Optional indices mapping X rows to full distance matrix
 
     Returns:
-        Tuple of (cluster_labels, cluster_medoids)
+        Tuple of (cluster_labels, cluster_medoids, distance_matrix)
         - cluster_labels: Array of cluster assignments for each input
         - cluster_medoids: Representative curves (medoid) for each cluster
+        - distance_matrix: The distance matrix used (for reuse in subsequent calls)
     """
-    # Precompute distance matrix with sophisticated penalties
-
-    distance_matrix = compute_beq_distance_matrix(
-        X,
-        chunk_size=hdbscan_params.distance_chunk_size,
-        rms_weight=hdbscan_params.distance_rms_weight,
-        cosine_weight=hdbscan_params.distance_cosine_weight,
-        cosine_scale=hdbscan_params.distance_cosine_scale,
-        rms_limit=hdbscan_params.rms_limit if hdbscan_params.use_constraints else None,
-        cosine_limit=hdbscan_params.cosine_limit
-        if hdbscan_params.use_constraints
-        else None,
-        max_limit=hdbscan_params.max_limit if hdbscan_params.use_constraints else None,
-        derivative_limit=hdbscan_params.derivative_limit
-        if hdbscan_params.use_constraints
-        else None,
-        penalty_scale=hdbscan_params.distance_penalty_scale,
-        rms_undershoot_tolerance=hdbscan_params.distance_rms_undershoot_tolerance,
-        rms_close_threshold=hdbscan_params.distance_rms_close_threshold,
-        cosine_boost_in_close_range=hdbscan_params.distance_cosine_boost_in_close_range,
-        soft_limit_factor=hdbscan_params.distance_soft_limit_factor,
-        soft_penalty_scale=hdbscan_params.distance_soft_penalty_scale,
-        n_jobs=hdbscan_params.distance_n_jobs,
-    )
+    if precomputed_distance_matrix is not None and entry_indices is not None:
+        # Extract submatrix for the given indices
+        logger.info(
+            f"Reusing precomputed distance matrix, extracting submatrix for {len(entry_indices)} indices"
+        )
+        distance_matrix = precomputed_distance_matrix[
+            np.ix_(entry_indices, entry_indices)
+        ]
+    else:
+        # Compute full distance matrix
+        logger.info("Computing distance matrix from scratch")
+        distance_matrix = compute_beq_distance_matrix(
+            X,
+            chunk_size=hdbscan_params.distance_chunk_size,
+            rms_weight=hdbscan_params.distance_rms_weight,
+            cosine_weight=hdbscan_params.distance_cosine_weight,
+            cosine_scale=hdbscan_params.distance_cosine_scale,
+            rms_limit=hdbscan_params.rms_limit
+            if hdbscan_params.use_constraints
+            else None,
+            cosine_limit=hdbscan_params.cosine_limit
+            if hdbscan_params.use_constraints
+            else None,
+            max_limit=hdbscan_params.max_limit
+            if hdbscan_params.use_constraints
+            else None,
+            derivative_limit=hdbscan_params.derivative_limit
+            if hdbscan_params.use_constraints
+            else None,
+            penalty_scale=hdbscan_params.distance_penalty_scale,
+            rms_undershoot_tolerance=hdbscan_params.distance_rms_undershoot_tolerance,
+            rms_close_threshold=hdbscan_params.distance_rms_close_threshold,
+            cosine_boost_in_close_range=hdbscan_params.distance_cosine_boost_in_close_range,
+            soft_limit_factor=hdbscan_params.distance_soft_limit_factor,
+            soft_penalty_scale=hdbscan_params.distance_soft_penalty_scale,
+            n_jobs=hdbscan_params.distance_n_jobs,
+        )
 
     # Run HDBSCAN clustering with precomputed distances
     clusterer = hdbscan.HDBSCAN(
@@ -736,11 +752,7 @@ def hdbscan_clustering(
         medoid_idx = np.argmin(distances)
         cluster_medoids.append(cluster_points[medoid_idx])
 
-    # Keep noise points as noise (label=-1) - they will be handled during assignment phase
-    # The iterative refinement will attempt to assign them, and they'll be rejected if they
-    # don't meet the acceptance criteria
-
-    return labels, np.array(cluster_medoids)
+    return labels, np.array(cluster_medoids), distance_matrix
 
 
 # ------------------------------
@@ -1000,7 +1012,6 @@ def compute_fan_curves(
 # ------------------------------
 # Full pipeline
 # ------------------------------
-# Update build_all_composites to use the new approach
 def build_all_composites(
     input_curves: np.ndarray,
     freqs: np.ndarray,
@@ -1015,11 +1026,8 @@ def build_all_composites(
     """
     Build BEQ composite filters via an iterative HDBSCAN clustering with final assignment phase.
 
-    This function operates in two phases:
-    1. Discovery Phase: Iteratively run HDBSCAN, keeping noise points as rejected to allow
-       them to form clusters in subsequent iterations.
-    2. Assignment Phase: After all clusters discovered, attempt to assign remaining rejected
-       entries to the best-matching composite using relaxed distance thresholds.
+    This function now precomputes the full distance matrix once and reuses it across all
+    iterations by extracting relevant submatrices.
 
     Args:
         input_curves: Full frequency response database
@@ -1031,16 +1039,9 @@ def build_all_composites(
         max_iterations: Maximum refinement iterations per HDBSCAN run
         min_reject_rate_delta: Minimum change in reject rate to continue iterating
         final_assignment_threshold_multiplier: Multiplier for the distance threshold in final assignment.
-            Values > 1.0 allow more lenient assignment of outliers (default: 1.5).
 
     Returns:
         a BEQResult object containing all cycles and final composites
-
-    Note:
-        The number of final composites is determined by HDBSCAN parameters:
-        - Increase min_cluster_size to get fewer, larger clusters
-        - Increase min_samples to get more conservative, tighter clusters
-        - Increase cluster_selection_epsilon to merge similar clusters
     """
     calcs: list[BEQCompositeComputation] = []
     weights = weights if weights is not None else np.ones_like(freqs)
@@ -1049,9 +1050,49 @@ def build_all_composites(
 
     all_entry_ids = list(range(0, input_curves.shape[0]))
 
-    # Phase 1: Discovery - iteratively find clusters, keep noise as rejected
+    # Precompute the full distance matrix once for all iterations
+    band_mask = (freqs >= band[0]) & (freqs <= band[1])
+    full_masked_catalogue = input_curves[:, band_mask]
+
     logger.info("=" * 80)
-    logger.info("PHASE 1: CLUSTER DISCOVERY (noise points kept as rejected)")
+    logger.info("PRECOMPUTING FULL DISTANCE MATRIX (will be reused across iterations)")
+    logger.info("=" * 80)
+
+    start_time = time.time()
+    # Use the first iteration params for distance computation
+    base_params = iteration_params[0] if iteration_params else HDBSCANParams()
+
+    full_distance_matrix = compute_beq_distance_matrix(
+        full_masked_catalogue,
+        chunk_size=base_params.distance_chunk_size,
+        rms_weight=base_params.distance_rms_weight,
+        cosine_weight=base_params.distance_cosine_weight,
+        cosine_scale=base_params.distance_cosine_scale,
+        rms_limit=base_params.rms_limit if base_params.use_constraints else None,
+        cosine_limit=base_params.cosine_limit if base_params.use_constraints else None,
+        max_limit=base_params.max_limit if base_params.use_constraints else None,
+        derivative_limit=base_params.derivative_limit
+        if base_params.use_constraints
+        else None,
+        penalty_scale=base_params.distance_penalty_scale,
+        rms_undershoot_tolerance=base_params.distance_rms_undershoot_tolerance,
+        rms_close_threshold=base_params.distance_rms_close_threshold,
+        cosine_boost_in_close_range=base_params.distance_cosine_boost_in_close_range,
+        soft_limit_factor=base_params.distance_soft_limit_factor,
+        soft_penalty_scale=base_params.distance_soft_penalty_scale,
+        n_jobs=base_params.distance_n_jobs,
+    )
+
+    elapsed = time.time() - start_time
+    logger.info(f"Full distance matrix computed in {elapsed:.3f}s")
+    logger.info(
+        f"Matrix shape: {full_distance_matrix.shape}, size: {full_distance_matrix.nbytes / 1024 / 1024:.2f} MB"
+    )
+
+    # Phase 1: Discovery - iteratively find clusters, keep noise as rejected
+    logger.info("")
+    logger.info("=" * 80)
+    logger.info("PHASE 1: CLUSTER DISCOVERY (reusing precomputed distance matrix)")
     logger.info("=" * 80)
 
     while assigned_rate >= 0.01 and param_idx < len(iteration_params):
@@ -1077,6 +1118,7 @@ def build_all_composites(
             max_iterations=max_iterations,
             min_reject_rate_delta=min_reject_rate_delta,
             assign_noise_points=False,  # Keep noise as rejected during discovery
+            precomputed_distance_matrix=full_distance_matrix,  # Pass precomputed matrix
         )
         calcs.append(last_calc)
         assigned_count = sum([a.total_assigned_count for a in calcs])
@@ -1116,16 +1158,13 @@ def build_all_composites(
 
         if newly_assigned > 0:
             # Recompute composite curves with newly assigned entries
-            band_mask = (freqs >= band[0]) & (freqs <= band[1])
-            masked_catalogue = input_curves[:, band_mask]
-
             for comp in result.composites:
                 if comp.assigned_entry_ids:
-                    assigned = masked_catalogue[comp.assigned_entry_ids, :]
+                    assigned = full_masked_catalogue[comp.assigned_entry_ids, :]
                     comp.mag_response = np.median(assigned, axis=0)
 
             # Recompute fan curves
-            compute_fan_curves(masked_catalogue, result.composites, fan_counts)
+            compute_fan_curves(full_masked_catalogue, result.composites, fan_counts)
 
         # Update result statistics
         total_assigned = sum(len(c.assigned_entry_ids) for c in result.composites)
@@ -1151,6 +1190,7 @@ def build_beq_composites(
     max_iterations: int = 10,
     min_reject_rate_delta: float = 0.005,
     assign_noise_points: bool = True,
+    precomputed_distance_matrix: np.ndarray | None = None,
 ) -> BEQCompositeComputation:
     """
     Build BEQ composite filters using HDBSCAN clustering.
@@ -1166,15 +1206,10 @@ def build_beq_composites(
         max_iterations: Maximum refinement iterations
         min_reject_rate_delta: Minimum change in reject rate to continue iterating
         assign_noise_points: whether noise points should be considered for assignment
+        precomputed_distance_matrix: Optional precomputed distance matrix for full catalogue
 
     Returns:
         BEQCompositeComputation with all cycles and final composites
-
-    Note:
-        The number of final composites is determined by HDBSCAN parameters:
-        - Increase min_cluster_size to get fewer, larger clusters
-        - Increase min_samples to get more conservative, tighter clusters
-        - Increase cluster_selection_epsilon to merge similar clusters
     """
     band_mask: np.ndarray = (freqs >= band[0]) & (freqs <= band[1])
     full_masked_catalogue = input_curves[:, band_mask]
@@ -1183,9 +1218,15 @@ def build_beq_composites(
         weights[band_mask] if weights is not None else None
     )
 
+    # Convert entry_ids to numpy array for efficient indexing
+    entry_indices = np.array(entry_ids)
+
     # Step 1: HDBSCAN clustering (replaces k-medoids + Ward)
-    labels, cluster_medoids = hdbscan_clustering(
-        scoped_masked_catalogue, hdbscan_params
+    labels, cluster_medoids, _ = hdbscan_clustering(
+        scoped_masked_catalogue,
+        hdbscan_params,
+        precomputed_distance_matrix=precomputed_distance_matrix,
+        entry_indices=entry_indices,
     )
 
     # Step 2: Create initial composites from cluster medians

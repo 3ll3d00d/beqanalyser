@@ -41,13 +41,16 @@ if __name__ == "__main__":
 
     params = [
         HDBSCANParams(
-            min_cluster_size=100, min_samples=10, cluster_selection_epsilon=3.0
+            min_cluster_size=50, min_samples=20, cluster_selection_epsilon=5.0
         ),
         HDBSCANParams(
-            min_cluster_size=50, min_samples=5, cluster_selection_epsilon=3.0
+            min_cluster_size=20, min_samples=50, cluster_selection_epsilon=5.0
         ),
         HDBSCANParams(
-            min_cluster_size=30, min_samples=3, cluster_selection_epsilon=3.0
+            min_cluster_size=50, min_samples=20, cluster_selection_epsilon=5.0
+        ),
+        HDBSCANParams(
+            min_cluster_size=30, min_samples=3, cluster_selection_epsilon=5.0
         ),
         HDBSCANParams(
             min_cluster_size=10, min_samples=3, cluster_selection_epsilon=5.0
