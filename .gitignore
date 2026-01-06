@@ -175,3 +175,4 @@ cython_debug/
 
 beq_composites.csv
 database.bin
+database.bin.sha256
