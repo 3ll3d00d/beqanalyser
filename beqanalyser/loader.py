@@ -49,15 +49,38 @@ class CatalogueDecoder(json.JSONDecoder):
         return dct
 
 
-def load() -> list[BEQFilter]:
+def load() -> tuple[list[BEQFilter], str]:
+    """
+    Loads a list of BEQFilter objects and an associated hash, either from a local
+    binary file or through a GitHub repository if the local file is unavailable
+    or raises an exception during loading. The method ensures data integrity by
+    maintaining and validating a SHA-256 hash of the data.
+
+    :return:
+        A tuple containing the list of BEQFilter objects and its corresponding
+        SHA-256 hash value as a string.
+    :rtype: tuple[list[BEQFilter], str]
+
+    :raises FileNotFoundError:
+        If the file `database.bin` is not found during the first load attempt.
+
+    :raises requests.exceptions.HTTPError:
+        If an HTTP error occurs when attempting to fetch the database from GitHub.
+    """
     a = time.time()
 
     try:
         with open('database.bin', 'r') as f:
-            data: list[dict] = json.load(f, cls=CatalogueDecoder)['data']
+            content = f.read()
+            data: list[BEQFilter] = json.loads(content, cls=CatalogueDecoder)['data']
+            with open('database.bin.sha256', 'r') as h:
+                data_hash = h.read()
+                import hashlib
+                actual_hash = hashlib.sha256(content.encode()).hexdigest()
+                assert data_hash == actual_hash, f'Data hash mismatch {data_hash} != {actual_hash}'
     except Exception as e:
         if not isinstance(e, FileNotFoundError):
-            logger.exception(f'Unable to load catalogue from database.bin, trying github')
+            logger.exception('Unable to load catalogue from database.bin, trying github')
         try:
             logger.info('Loading catalogue from github')
             r = requests.get('https://raw.githubusercontent.com/3ll3d00d/beqcatalogue/master/docs/database.json',
@@ -66,12 +89,17 @@ def load() -> list[BEQFilter]:
             with ProcessPoolExecutor() as executor:
                 data: list[BEQFilter] = list(executor.map(convert, (CatalogueEntry(f'{idx}', e) for idx, e in enumerate(json.loads(r.content)) if e.get('filters', []))))
             with open('database.bin', 'w') as f:
-                json.dump({'data': data}, f, cls=CatalogueEncoder)
+                output = json.dumps({'data': data}, cls=CatalogueEncoder)
+                f.write(output)
+                with open('database.bin.sha256', 'w') as h:
+                    import hashlib
+                    data_hash = hashlib.sha256(output.encode()).hexdigest()
+                    h.write(data_hash)
         except requests.exceptions.HTTPError as e:
-            logger.exception(f'Unable to load catalogue from database')
+            logger.exception('Unable to load catalogue from database')
             raise e
 
     b = time.time()
     logger.info(f'Loaded catalogue in {b - a:.3g}s')
 
-    return data
+    return data, data_hash

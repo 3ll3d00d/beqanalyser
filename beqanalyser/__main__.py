@@ -7,6 +7,7 @@ import numpy as np
 from beqanalyser import BEQFilter
 from beqanalyser.analyser import (
     HDBSCANParams,
+    DistanceParams,
     build_all_composites,
 )
 from beqanalyser.loader import load
@@ -33,7 +34,7 @@ if __name__ == "__main__":
     fan_counts = (5, 10, 20, 50, 100)
     use_constraints = True
 
-    catalogue: list[BEQFilter] = load()
+    catalogue, data_hash = load()
     by_author_by_year = defaultdict(lambda: defaultdict(int))
 
     freqs = catalogue[0].mag_freqs
@@ -41,22 +42,22 @@ if __name__ == "__main__":
 
     params = [
         HDBSCANParams(
-            min_cluster_size=50, min_samples=20, cluster_selection_epsilon=5.0
+            min_cluster_size=30, min_samples=20, cluster_selection_epsilon=10.0
         ),
         HDBSCANParams(
-            min_cluster_size=20, min_samples=50, cluster_selection_epsilon=5.0
+            min_cluster_size=30, min_samples=20, cluster_selection_epsilon=10.0
         ),
         HDBSCANParams(
-            min_cluster_size=50, min_samples=20, cluster_selection_epsilon=5.0
+            min_cluster_size=30, min_samples=20, cluster_selection_epsilon=10.0
         ),
         HDBSCANParams(
-            min_cluster_size=30, min_samples=3, cluster_selection_epsilon=5.0
+            min_cluster_size=30, min_samples=10, cluster_selection_epsilon=10.0
         ),
         HDBSCANParams(
-            min_cluster_size=10, min_samples=3, cluster_selection_epsilon=5.0
+            min_cluster_size=10, min_samples=5, cluster_selection_epsilon=10.0
         ),
         HDBSCANParams(
-            min_cluster_size=5, min_samples=3, cluster_selection_epsilon=10.0
+            min_cluster_size=5, min_samples=5, cluster_selection_epsilon=10.0
         ),
     ]
 
@@ -66,6 +67,7 @@ if __name__ == "__main__":
         band=(min_freq, max_freq),
         fan_counts=fan_counts,
         iteration_params=params,
+        distance_params=DistanceParams(),
     )
 
     plot_histograms(result.composites)

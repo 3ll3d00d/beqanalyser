@@ -2,6 +2,7 @@ import copy
 import dataclasses
 import logging
 import time
+from collections import defaultdict
 from dataclasses import MISSING, dataclass, fields
 from multiprocessing import Pool, cpu_count
 
@@ -23,14 +24,40 @@ from beqanalyser import (
 logger = logging.getLogger(__name__)
 
 
-@dataclass(slots=True, repr=False)
-class HDBSCANParams:
-    """
-    Configuration parameters for HDBSCAN-based clustering and custom
-    distance computation used during BEQ composite construction.
+@dataclass(repr=False)
+class DefaultAwareRepr:
+    def __repr__(self) -> str:
+        """
+        Constructs a string representation of the class, including only attributes that
+        are not equal to their default values or do not have a predefined baseline
+        (default value).
 
-    This groups all HDBSCAN-related knobs, including clustering behaviour,
-    distance weighting, constraint handling, and parallelism.
+        :return: String representation of the object with attributes and their
+                 corresponding values if they differ from the defaults.
+        :rtype: str
+        """
+
+        parts: list[str] = []
+
+        for f in fields(self):
+            value = getattr(self, f.name)
+
+            if f.default is MISSING:
+                # No baseline → always include
+                parts.append(f"{f.name}={value!r}")
+            elif value != f.default:
+                parts.append(f"{f.name}={value!r}")
+
+        if parts:
+            return f"{self.__class__.__name__}({', '.join(parts)})"
+        else:
+            return f"{self.__class__.__name__}(all defaults)"
+
+
+@dataclass(slots=True, repr=False)
+class DistanceParams(DefaultAwareRepr):
+    """
+    Configuration parameters for distance computation used during BEQ composite construction.
     """
 
     # --- Acceptance / rejection limits ---
@@ -46,17 +73,6 @@ class HDBSCANParams:
 
     derivative_limit: float = 1.0
     """Maximum acceptable derivative RMS."""
-
-    # --- Core HDBSCAN parameters ---
-
-    min_cluster_size: int = 500
-    """Minimum cluster size for HDBSCAN (controls number of clusters)."""
-
-    min_samples: int | None = 50
-    """Minimum samples for core points (controls cluster density)."""
-
-    cluster_selection_epsilon: float = 0.0
-    """Distance threshold for merging clusters (0.0 = no merging)."""
 
     # --- Distance computation configuration ---
 
@@ -125,31 +141,25 @@ class HDBSCANParams:
     (-1 = use all available CPUs).
     """
 
-    def __repr__(self) -> str:
-        """
-        Constructs a string representation of the class, including only attributes that
-        are not equal to their default values or do not have a predefined baseline
-        (default value).
 
-        :return: String representation of the object with attributes and their
-                 corresponding values if they differ from the defaults.
-        :rtype: str
-        """
-        parts: list[str] = []
+@dataclass(slots=True, repr=False)
+class HDBSCANParams(DefaultAwareRepr):
+    """
+    Configuration parameters for HDBSCAN-based clustering and custom
+    distance computation used during BEQ composite construction.
 
-        for f in fields(self):
-            value = getattr(self, f.name)
+    This groups all HDBSCAN-related knobs, including clustering behaviour,
+    distance weighting, constraint handling, and parallelism.
+    """
 
-            if f.default is MISSING:
-                # No baseline → always include
-                parts.append(f"{f.name}={value!r}")
-            elif value != f.default:
-                parts.append(f"{f.name}={value!r}")
+    min_cluster_size: int = 500
+    """Minimum cluster size for HDBSCAN (controls number of clusters)."""
 
-        if parts:
-            return f"{self.__class__.__name__}({', '.join(parts)})"
-        else:
-            return f"{self.__class__.__name__}(all defaults)"
+    min_samples: int | None = 50
+    """Minimum samples for core points (controls cluster density)."""
+
+    cluster_selection_epsilon: float = 0.0
+    """Distance threshold for merging clusters (0.0 = no merging)."""
 
 
 # ------------------------------
@@ -161,7 +171,7 @@ def _compute_distance_components(
     max_vals: np.ndarray | float,
     deriv_vals: np.ndarray | float | None,
     mean_diff_vals: np.ndarray | float,
-    hdbscan_params: HDBSCANParams,
+    params: DistanceParams,
 ) -> np.ndarray | float:
     """
     Core distance computation logic shared between matrix and single-pair calculations.
@@ -177,7 +187,7 @@ def _compute_distance_components(
         max_vals: Maximum absolute deviation values (can be scalar or array)
         deriv_vals: Derivative RMS values (can be scalar or array, or None)
         mean_diff_vals: Mean difference values for undershoot detection (can be scalar or array)
-        hdbscan_params: Parameters controlling distance computation
+        params: Parameters controlling distance computation
 
     Returns:
         Distance scores (same shape as input arrays)
@@ -189,8 +199,8 @@ def _compute_distance_components(
     is_undershoot = mean_diff_vals < 0
     rms_adjusted = rms_vals
 
-    if hdbscan_params.distance_rms_undershoot_tolerance > 1.0:
-        undershoot_factor = 1.0 / hdbscan_params.distance_rms_undershoot_tolerance
+    if params.distance_rms_undershoot_tolerance > 1.0:
+        undershoot_factor = 1.0 / params.distance_rms_undershoot_tolerance
         if isinstance(rms_vals, np.ndarray):
             rms_adjusted = np.where(
                 is_undershoot, rms_vals * undershoot_factor, rms_vals
@@ -199,26 +209,24 @@ def _compute_distance_components(
             rms_adjusted = rms_vals * undershoot_factor
 
     # 2. Detect "close" RMS range and boost cosine weight
-    is_close = rms_vals < hdbscan_params.distance_rms_close_threshold
+    is_close = rms_vals < params.distance_rms_close_threshold
     if isinstance(is_close, np.ndarray):
         cosine_weight_adjusted = np.where(
             is_close,
-            hdbscan_params.distance_cosine_weight
-            * hdbscan_params.distance_cosine_boost_in_close_range,
-            hdbscan_params.distance_cosine_weight,
+            params.distance_cosine_weight * params.distance_cosine_boost_in_close_range,
+            params.distance_cosine_weight,
         )
     else:
         cosine_weight_adjusted = (
-            hdbscan_params.distance_cosine_weight
-            * hdbscan_params.distance_cosine_boost_in_close_range
+            params.distance_cosine_weight * params.distance_cosine_boost_in_close_range
             if is_close
-            else hdbscan_params.distance_cosine_weight
+            else params.distance_cosine_weight
         )
 
     # Compute base distance with adaptive weighting
     base_distance = (
-        hdbscan_params.distance_rms_weight * rms_adjusted
-        + cosine_weight_adjusted * cos_dist * hdbscan_params.distance_cosine_scale
+        params.distance_rms_weight * rms_adjusted
+        + cosine_weight_adjusted * cos_dist * params.distance_cosine_scale
     )
 
     # 3. Tiered penalty system
@@ -227,46 +235,37 @@ def _compute_distance_components(
     else:
         penalty = 0.0
 
-    if hdbscan_params.use_constraints:
+    if params.use_constraints:
         # RMS penalties
-        if hdbscan_params.rms_limit is not None:
-            soft_rms = (
-                hdbscan_params.rms_limit * hdbscan_params.distance_soft_limit_factor
-            )
+        if params.rms_limit is not None:
+            soft_rms = params.rms_limit * params.distance_soft_limit_factor
 
             # Soft penalty zone
-            soft_violations = (rms_vals > soft_rms) & (
-                rms_vals <= hdbscan_params.rms_limit
-            )
+            soft_violations = (rms_vals > soft_rms) & (rms_vals <= params.rms_limit)
             if isinstance(soft_violations, np.ndarray):
                 penalty = (
                     penalty
                     + soft_violations.astype(np.float32)
-                    * hdbscan_params.distance_soft_penalty_scale
+                    * params.distance_soft_penalty_scale
                 )
             elif soft_violations:
-                penalty = penalty + hdbscan_params.distance_soft_penalty_scale
+                penalty = penalty + params.distance_soft_penalty_scale
 
             # Hard penalty zone with asymmetric handling
-            hard_violations_overshoot = (
-                rms_vals > hdbscan_params.rms_limit
-            ) & ~is_undershoot
+            hard_violations_overshoot = (rms_vals > params.rms_limit) & ~is_undershoot
             if isinstance(hard_violations_overshoot, np.ndarray):
                 penalty = (
                     penalty
                     + hard_violations_overshoot.astype(np.float32)
-                    * hdbscan_params.distance_penalty_scale
+                    * params.distance_penalty_scale
                 )
             elif hard_violations_overshoot:
-                penalty = penalty + hdbscan_params.distance_penalty_scale
+                penalty = penalty + params.distance_penalty_scale
 
             # Reduced penalty for undershoot violations
-            hard_violations_undershoot = (
-                rms_vals > hdbscan_params.rms_limit
-            ) & is_undershoot
+            hard_violations_undershoot = (rms_vals > params.rms_limit) & is_undershoot
             reduced_penalty = (
-                hdbscan_params.distance_penalty_scale
-                / hdbscan_params.distance_rms_undershoot_tolerance
+                params.distance_penalty_scale / params.distance_rms_undershoot_tolerance
             )
             if isinstance(hard_violations_undershoot, np.ndarray):
                 penalty = (
@@ -277,95 +276,85 @@ def _compute_distance_components(
                 penalty = penalty + reduced_penalty
 
         # Cosine penalties
-        if hdbscan_params.cosine_limit is not None:
-            soft_cos = hdbscan_params.cosine_limit + (
-                1.0 - hdbscan_params.cosine_limit
-            ) * (1.0 - hdbscan_params.distance_soft_limit_factor)
+        if params.cosine_limit is not None:
+            soft_cos = params.cosine_limit + (1.0 - params.cosine_limit) * (
+                1.0 - params.distance_soft_limit_factor
+            )
 
             # Soft penalty zone
             soft_violations = (cos_sim_vals < soft_cos) & (
-                cos_sim_vals >= hdbscan_params.cosine_limit
+                cos_sim_vals >= params.cosine_limit
             )
             if isinstance(soft_violations, np.ndarray):
                 penalty = (
                     penalty
                     + soft_violations.astype(np.float32)
-                    * hdbscan_params.distance_soft_penalty_scale
+                    * params.distance_soft_penalty_scale
                 )
             elif soft_violations:
-                penalty = penalty + hdbscan_params.distance_soft_penalty_scale
+                penalty = penalty + params.distance_soft_penalty_scale
 
             # Hard penalty zone
-            hard_violations = cos_sim_vals < hdbscan_params.cosine_limit
+            hard_violations = cos_sim_vals < params.cosine_limit
             if isinstance(hard_violations, np.ndarray):
                 penalty = (
                     penalty
-                    + hard_violations.astype(np.float32)
-                    * hdbscan_params.distance_penalty_scale
+                    + hard_violations.astype(np.float32) * params.distance_penalty_scale
                 )
             elif hard_violations:
-                penalty = penalty + hdbscan_params.distance_penalty_scale
+                penalty = penalty + params.distance_penalty_scale
 
         # Max deviation penalties
-        if hdbscan_params.max_limit is not None:
-            soft_max = (
-                hdbscan_params.max_limit * hdbscan_params.distance_soft_limit_factor
-            )
+        if params.max_limit is not None:
+            soft_max = params.max_limit * params.distance_soft_limit_factor
 
             # Soft penalty zone
-            soft_violations = (max_vals > soft_max) & (
-                max_vals <= hdbscan_params.max_limit
-            )
+            soft_violations = (max_vals > soft_max) & (max_vals <= params.max_limit)
             if isinstance(soft_violations, np.ndarray):
                 penalty = (
                     penalty
                     + soft_violations.astype(np.float32)
-                    * hdbscan_params.distance_soft_penalty_scale
+                    * params.distance_soft_penalty_scale
                 )
             elif soft_violations:
-                penalty = penalty + hdbscan_params.distance_soft_penalty_scale
+                penalty = penalty + params.distance_soft_penalty_scale
 
             # Hard penalty zone
-            hard_violations = max_vals > hdbscan_params.max_limit
+            hard_violations = max_vals > params.max_limit
             if isinstance(hard_violations, np.ndarray):
                 penalty = (
                     penalty
-                    + hard_violations.astype(np.float32)
-                    * hdbscan_params.distance_penalty_scale
+                    + hard_violations.astype(np.float32) * params.distance_penalty_scale
                 )
             elif hard_violations:
-                penalty = penalty + hdbscan_params.distance_penalty_scale
+                penalty = penalty + params.distance_penalty_scale
 
         # Derivative penalties
-        if hdbscan_params.derivative_limit is not None and deriv_vals is not None:
-            soft_deriv = (
-                hdbscan_params.derivative_limit
-                * hdbscan_params.distance_soft_limit_factor
-            )
+        if params.derivative_limit is not None and deriv_vals is not None:
+            soft_deriv = params.derivative_limit * params.distance_soft_limit_factor
 
             # Soft penalty zone
             soft_violations = (deriv_vals > soft_deriv) & (
-                deriv_vals <= hdbscan_params.derivative_limit
+                deriv_vals <= params.derivative_limit
             )
             if isinstance(soft_violations, np.ndarray):
                 penalty = (
                     penalty
                     + soft_violations.astype(np.float32)
-                    * hdbscan_params.distance_soft_penalty_scale
+                    * params.distance_soft_penalty_scale
                 )
             elif soft_violations:
-                penalty = penalty + hdbscan_params.distance_soft_penalty_scale
+                penalty = penalty + params.distance_soft_penalty_scale
 
             # Hard penalty zone
-            hard_violations = deriv_vals > hdbscan_params.derivative_limit
+            hard_violations = deriv_vals > params.derivative_limit
             if isinstance(hard_violations, np.ndarray):
                 penalty = (
                     penalty
-                    + hard_violations.astype(np.float32)
-                    * hdbscan_params.distance_penalty_scale
+                    + hard_violations.astype(np.float32) * params.distance_penalty_scale
                 )
             elif hard_violations:
-                penalty = penalty + hdbscan_params.distance_penalty_scale
+                penalty = penalty + params.distance_penalty_scale
 
     # Combine base distance with penalties
     return base_distance + penalty
@@ -374,7 +363,7 @@ def _compute_distance_components(
 def compute_composite_distance(
     entry: np.ndarray,
     composite: np.ndarray,
-    hdbscan_params: HDBSCANParams,
+    params: DistanceParams,
     weights: np.ndarray | None = None,
 ) -> tuple[float, float, float, float, float]:
     """
@@ -385,7 +374,7 @@ def compute_composite_distance(
     Args:
         entry: Input curve to compare
         composite: Composite curve to compare against
-        hdbscan_params: Parameters controlling distance computation
+        params: Parameters controlling distance computation
         weights: Optional frequency weights for RMS calculation
 
     Returns:
@@ -406,7 +395,7 @@ def compute_composite_distance(
         max_vals=max_delta,
         deriv_vals=deriv_delta,
         mean_diff_vals=mean_diff,
-        hdbscan_params=hdbscan_params,
+        params=params,
     )
 
     return float(distance_score), rms_delta, max_delta, cos_sim, deriv_delta
@@ -591,8 +580,7 @@ def compute_beq_distance_matrix(
     b = time.time()
     logger.info(f"Computed base distances in {b - a:.3f}s")
 
-    # Create HDBSCANParams object for distance computation
-    temp_params = HDBSCANParams(
+    temp_params = DistanceParams(
         rms_limit=rms_limit,
         cosine_limit=cosine_limit,
         max_limit=max_limit,
@@ -626,7 +614,7 @@ def compute_beq_distance_matrix(
             max_vals=max_row,
             deriv_vals=deriv_row,
             mean_diff_vals=mean_diff,
-            hdbscan_params=temp_params,
+            params=temp_params,
         ).astype(np.float64)
 
         logger.debug(f"  Processed {end_i}/{n_samples} rows")
@@ -655,6 +643,7 @@ def compute_beq_distance_matrix(
 # ------------------------------
 def hdbscan_clustering(
     X: np.ndarray,
+    distance_params: DistanceParams,
     hdbscan_params: HDBSCANParams,
     precomputed_distance_matrix: np.ndarray | None = None,
     entry_indices: np.ndarray | None = None,
@@ -664,6 +653,7 @@ def hdbscan_clustering(
 
     Args:
         X: Input data matrix (n_samples, n_features)
+        distance_params: Distance computation parameters
         hdbscan_params: HDBSCAN parameters
         precomputed_distance_matrix: Optional precomputed full distance matrix
         entry_indices: Optional indices mapping X rows to full distance matrix
@@ -687,29 +677,29 @@ def hdbscan_clustering(
         logger.info("Computing distance matrix from scratch")
         distance_matrix = compute_beq_distance_matrix(
             X,
-            chunk_size=hdbscan_params.distance_chunk_size,
-            rms_weight=hdbscan_params.distance_rms_weight,
-            cosine_weight=hdbscan_params.distance_cosine_weight,
-            cosine_scale=hdbscan_params.distance_cosine_scale,
-            rms_limit=hdbscan_params.rms_limit
-            if hdbscan_params.use_constraints
+            chunk_size=distance_params.distance_chunk_size,
+            rms_weight=distance_params.distance_rms_weight,
+            cosine_weight=distance_params.distance_cosine_weight,
+            cosine_scale=distance_params.distance_cosine_scale,
+            rms_limit=distance_params.rms_limit
+            if distance_params.use_constraints
             else None,
-            cosine_limit=hdbscan_params.cosine_limit
-            if hdbscan_params.use_constraints
+            cosine_limit=distance_params.cosine_limit
+            if distance_params.use_constraints
             else None,
-            max_limit=hdbscan_params.max_limit
-            if hdbscan_params.use_constraints
+            max_limit=distance_params.max_limit
+            if distance_params.use_constraints
             else None,
-            derivative_limit=hdbscan_params.derivative_limit
-            if hdbscan_params.use_constraints
+            derivative_limit=distance_params.derivative_limit
+            if distance_params.use_constraints
             else None,
-            penalty_scale=hdbscan_params.distance_penalty_scale,
-            rms_undershoot_tolerance=hdbscan_params.distance_rms_undershoot_tolerance,
-            rms_close_threshold=hdbscan_params.distance_rms_close_threshold,
-            cosine_boost_in_close_range=hdbscan_params.distance_cosine_boost_in_close_range,
-            soft_limit_factor=hdbscan_params.distance_soft_limit_factor,
-            soft_penalty_scale=hdbscan_params.distance_soft_penalty_scale,
-            n_jobs=hdbscan_params.distance_n_jobs,
+            penalty_scale=distance_params.distance_penalty_scale,
+            rms_undershoot_tolerance=distance_params.distance_rms_undershoot_tolerance,
+            rms_close_threshold=distance_params.distance_rms_close_threshold,
+            cosine_boost_in_close_range=distance_params.distance_cosine_boost_in_close_range,
+            soft_limit_factor=distance_params.distance_soft_limit_factor,
+            soft_penalty_scale=distance_params.distance_soft_penalty_scale,
+            n_jobs=distance_params.distance_n_jobs,
         )
 
     # Run HDBSCAN clustering with precomputed distances
@@ -761,13 +751,13 @@ def hdbscan_clustering(
 def map_to_best_composite(
     entry: np.ndarray,
     composites: list[BEQComposite],
-    hdbscan_params: HDBSCANParams,
+    params: DistanceParams,
     entry_id: int,
     cluster_label: int,
     weights: np.ndarray | None = None,
 ) -> None:
     """
-    Assign entry to composites using the distance score from compute_beq_distance_matrix.
+    Records the
 
     The composite with the lowest distance score is selected as best. Entries are rejected
     if their distance score indicates hard limit violations (determined by penalty thresholds),
@@ -776,7 +766,7 @@ def map_to_best_composite(
     Args:
         entry: Input curve to assign
         composites: List of composite candidates
-        hdbscan_params: Parameters controlling distance computation and limits
+        params: Parameters controlling distance computation and limits
         entry_id: Index of entry in catalogue
         cluster_label: Cluster label assigned by HDBSCAN, -1 if identified as noise
         weights: Optional frequency weights for RMS calculation
@@ -786,16 +776,12 @@ def map_to_best_composite(
     # Define the rejection threshold based on hard penalties
     # If the distance score includes hard penalties, it indicates constraint violations
     rejection_threshold = (
-        hdbscan_params.distance_penalty_scale
-        if hdbscan_params.use_constraints
-        else float("inf")
+        params.distance_penalty_scale if params.use_constraints else float("inf")
     )
 
     for comp in composites:
         distance_score, rms_delta, max_delta, cos_sim, deriv_delta = (
-            compute_composite_distance(
-                entry, comp.mag_response, hdbscan_params, weights
-            )
+            compute_composite_distance(entry, comp.mag_response, params, weights)
         )
 
         mapping = BEQFilterMapping(
@@ -811,8 +797,8 @@ def map_to_best_composite(
         # Reject if the distance score indicates a hard limit violation or if it was already identified as noise
         if cluster_label == -1:
             mapping.rejection_reason = RejectionReason.NOISE
-        elif distance_score >= rejection_threshold:
-            mapping.rejection_reason = RejectionReason.HARD_LIMIT
+        # elif distance_score >= rejection_threshold:
+        #     mapping.rejection_reason = RejectionReason.HARD_LIMIT
 
         composite_scores.append((distance_score, mapping))
         comp.mappings.append(mapping)
@@ -841,7 +827,7 @@ def assign_remaining_entries(
     remaining_entry_ids: list[int],
     all_composites: list[BEQComposite],
     freqs: np.ndarray,
-    hdbscan_params: HDBSCANParams,
+    params: DistanceParams,
     weights: np.ndarray | None = None,
     band: tuple[float, float] = (5, 50),
     distance_threshold_multiplier: float = 1.5,
@@ -858,7 +844,7 @@ def assign_remaining_entries(
         remaining_entry_ids: Entry IDs that were not assigned during clustering
         all_composites: All composites discovered across all iterations
         freqs: Frequency array
-        hdbscan_params: Base parameters for distance computation
+        params: Base parameters for distance computation
         weights: Optional frequency weights
         band: Frequency band to analyze
         distance_threshold_multiplier: Multiplier for acceptable distance threshold.
@@ -880,7 +866,7 @@ def assign_remaining_entries(
     )
 
     # Create relaxed parameters for final assignment
-    relaxed_params = copy.deepcopy(hdbscan_params)
+    relaxed_params = copy.deepcopy(params)
     if relaxed_params.rms_limit is not None:
         relaxed_params.rms_limit *= distance_threshold_multiplier
     if relaxed_params.max_limit is not None:
@@ -903,8 +889,12 @@ def assign_remaining_entries(
         else float("inf")
     )
 
-    newly_assigned = 0
     still_rejected = 0
+    newly_assigned_counts_by_composite = defaultdict(int)
+    previously_assigned_counts_by_composite = {
+        c.id: len(c.assigned_entry_ids)
+        for c in sorted(all_composites, key=lambda c: c.id)
+    }
 
     for entry_id in remaining_entry_ids:
         entry = masked_catalogue[entry_id]
@@ -941,10 +931,19 @@ def assign_remaining_entries(
                 still_rejected += 1
             else:
                 best_mapping.is_best = True
-                newly_assigned += 1
+                newly_assigned_counts_by_composite[best_composite.id] = (
+                    newly_assigned_counts_by_composite[best_composite.id] + 1
+                )
 
             best_composite.mappings.append(best_mapping)
 
+    for composite_id, count in previously_assigned_counts_by_composite.items():
+        new_count = newly_assigned_counts_by_composite[composite_id]
+        logger.info(
+            f"  {composite_id}: {count} + {new_count} = {count + new_count} entries assigned (+{new_count / (count + new_count):.1%}"
+        )
+
+    newly_assigned = sum(newly_assigned_counts_by_composite.values())
     logger.info(
         f"Final assignment: {newly_assigned} newly assigned, {still_rejected} still rejected "
         f"({100.0 * newly_assigned / len(remaining_entry_ids):.1f}% success rate)"
@@ -1015,6 +1014,7 @@ def compute_fan_curves(
 def build_all_composites(
     input_curves: np.ndarray,
     freqs: np.ndarray,
+    distance_params: DistanceParams,
     iteration_params: list[HDBSCANParams],
     weights: np.ndarray | None = None,
     band: tuple[float, float] = (5, 50),
@@ -1032,6 +1032,7 @@ def build_all_composites(
     Args:
         input_curves: Full frequency response database
         freqs: Frequency array.
+        distance_params: Parameters controlling distance computation and limits
         iteration_params: parameters for each iteration, predominantly aimed at hdbscan configuration.
         weights: Optional frequency weights
         band: Frequency band to analyse (min_freq, max_freq)
@@ -1059,28 +1060,32 @@ def build_all_composites(
     logger.info("=" * 80)
 
     start_time = time.time()
-    # Use the first iteration params for distance computation
-    base_params = iteration_params[0] if iteration_params else HDBSCANParams()
 
     full_distance_matrix = compute_beq_distance_matrix(
         full_masked_catalogue,
-        chunk_size=base_params.distance_chunk_size,
-        rms_weight=base_params.distance_rms_weight,
-        cosine_weight=base_params.distance_cosine_weight,
-        cosine_scale=base_params.distance_cosine_scale,
-        rms_limit=base_params.rms_limit if base_params.use_constraints else None,
-        cosine_limit=base_params.cosine_limit if base_params.use_constraints else None,
-        max_limit=base_params.max_limit if base_params.use_constraints else None,
-        derivative_limit=base_params.derivative_limit
-        if base_params.use_constraints
+        chunk_size=distance_params.distance_chunk_size,
+        rms_weight=distance_params.distance_rms_weight,
+        cosine_weight=distance_params.distance_cosine_weight,
+        cosine_scale=distance_params.distance_cosine_scale,
+        rms_limit=distance_params.rms_limit
+        if distance_params.use_constraints
         else None,
-        penalty_scale=base_params.distance_penalty_scale,
-        rms_undershoot_tolerance=base_params.distance_rms_undershoot_tolerance,
-        rms_close_threshold=base_params.distance_rms_close_threshold,
-        cosine_boost_in_close_range=base_params.distance_cosine_boost_in_close_range,
-        soft_limit_factor=base_params.distance_soft_limit_factor,
-        soft_penalty_scale=base_params.distance_soft_penalty_scale,
-        n_jobs=base_params.distance_n_jobs,
+        cosine_limit=distance_params.cosine_limit
+        if distance_params.use_constraints
+        else None,
+        max_limit=distance_params.max_limit
+        if distance_params.use_constraints
+        else None,
+        derivative_limit=distance_params.derivative_limit
+        if distance_params.use_constraints
+        else None,
+        penalty_scale=distance_params.distance_penalty_scale,
+        rms_undershoot_tolerance=distance_params.distance_rms_undershoot_tolerance,
+        rms_close_threshold=distance_params.distance_rms_close_threshold,
+        cosine_boost_in_close_range=distance_params.distance_cosine_boost_in_close_range,
+        soft_limit_factor=distance_params.distance_soft_limit_factor,
+        soft_penalty_scale=distance_params.distance_soft_penalty_scale,
+        n_jobs=distance_params.distance_n_jobs,
     )
 
     elapsed = time.time() - start_time
@@ -1114,6 +1119,7 @@ def build_all_composites(
             weights=weights,
             band=band,
             fan_counts=fan_counts,
+            distance_params=distance_params,
             hdbscan_params=iteration_params[param_idx],
             max_iterations=max_iterations,
             min_reject_rate_delta=min_reject_rate_delta,
@@ -1139,15 +1145,12 @@ def build_all_composites(
     assigned_ids = result.assigned_entry_ids
     remaining_ids = set(all_entry_ids) - assigned_ids
     if remaining_ids and final_assignment_threshold_multiplier > 0:
-        # Use the last (most lenient) iteration params for final assignment
-        final_params = iteration_params[-1] if iteration_params else HDBSCANParams()
-
         newly_assigned, still_rejected = assign_remaining_entries(
             input_curves=input_curves,
             remaining_entry_ids=list(remaining_ids),
             all_composites=result.composites,
             freqs=freqs,
-            hdbscan_params=final_params,
+            params=distance_params,
             weights=weights,
             band=band,
             distance_threshold_multiplier=final_assignment_threshold_multiplier,
@@ -1183,6 +1186,7 @@ def build_beq_composites(
     input_curves: np.ndarray,
     entry_ids: list[int],
     freqs: np.ndarray,
+    distance_params: DistanceParams,
     hdbscan_params: HDBSCANParams,
     weights: np.ndarray | None = None,
     band: tuple[float, float] = (5, 50),
@@ -1224,6 +1228,7 @@ def build_beq_composites(
     # Step 1: HDBSCAN clustering (replaces k-medoids + Ward)
     labels, cluster_medoids, _ = hdbscan_clustering(
         scoped_masked_catalogue,
+        distance_params,
         hdbscan_params,
         precomputed_distance_matrix=precomputed_distance_matrix,
         entry_indices=entry_indices,
@@ -1234,8 +1239,15 @@ def build_beq_composites(
     for cluster_id in range(len(cluster_medoids)):
         cluster_mask = labels == cluster_id
         cluster_curves = scoped_masked_catalogue[cluster_mask]
-        # Use median of cluster rather than medoid for initial composite
-        composite_curve = np.median(cluster_curves, axis=0)
+        # prefer cluster medoid as the composite unless it's a long way from the median (unlikely)
+        median_curve = np.median(cluster_curves, axis=0)
+        medoid_curve = cluster_medoids[cluster_id]
+        medoid_distance, _, _, _, _ = compute_composite_distance(
+            medoid_curve, median_curve, distance_params
+        )
+        # Median drifted too far, fall back to medoid
+        medoid_too_far = medoid_distance > distance_params.distance_penalty_scale
+        composite_curve = median_curve if medoid_too_far else medoid_curve
         composites.append(BEQComposite(cluster_id, composite_curve))
 
     iterations: list[ComputationCycle] = [ComputationCycle(0, composites)]
@@ -1264,7 +1276,7 @@ def build_beq_composites(
             map_to_best_composite(
                 entry,
                 iterations[-1].composites,
-                hdbscan_params,
+                distance_params,
                 entry_ids[i],
                 labels[i],
                 weights=band_weights,
