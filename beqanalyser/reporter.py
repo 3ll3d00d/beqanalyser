@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+from matplotlib.gridspec import GridSpec
 from matplotlib.ticker import StrMethodFormatter
 from scipy.stats import gaussian_kde
 
@@ -56,7 +57,7 @@ def summarise_assignments(iteration: int, computation: BEQCompositeComputation, 
 
 
 def plot_composite_evolution(
-    computation: BEQCompositeComputation,
+    result: BEQResult,
     freqs: np.ndarray,
     band: tuple[float, float] = (5, 50),
     figsize: tuple[int, int] | None = None,
@@ -69,27 +70,19 @@ def plot_composite_evolution(
     evolved through the iterative refinement process.
 
     Args:
-        computation: BEQCompositeComputation result from build_beq_composites
+        result: result from build_beq_composites
         freqs: Full frequency array
         band: Frequency band to display (min_freq, max_freq)
         figsize: Figure size as (width, height). If None, auto-calculated
         save_path: Optional path to save the figure. If None, displays interactively
     """
-    try:
-        import matplotlib.pyplot as plt
-        from matplotlib.gridspec import GridSpec
-    except ImportError:
-        logger.error(
-            "matplotlib is required for plotting. Install with: pip install matplotlib"
-        )
-        return
-
     # Extract band frequencies
     band_mask = (freqs >= band[0]) & (freqs <= band[1])
     band_freqs = freqs[band_mask]
 
-    # Get number of composites
-    n_composites = len(computation.cycles[0].composites)
+    # Get total number of composites & max no of iterations
+    n_composites = len(result.composites)
+    n_iterations = max(len([y for y in c.cycles if not y.is_copy]) for c in result.calculations)
 
     # Calculate grid dimensions (try to make it roughly square)
     n_cols = int(np.ceil(np.sqrt(n_composites)))
@@ -103,47 +96,46 @@ def plot_composite_evolution(
     fig = plt.figure(figsize=figsize)
     gs = GridSpec(n_rows, n_cols, figure=fig, hspace=0.3, wspace=0.3)
 
-    # Color map for iterations
-    n_iterations = len(computation.cycles)
+    # Colour map for iterations
     colors = plt.cm.viridis(np.linspace(0, 1, n_iterations))
 
     # Plot each composite
-    for comp_id in range(n_composites):
-        row = comp_id // n_cols
-        col = comp_id % n_cols
-        ax = fig.add_subplot(gs[row, col])
+    pos = -1
+    calc = -1
+    for computation in result.calculations:
+        calc += 1
+        for j in range(len(computation.result.composites)):
+            pos += 1
+            row = pos // n_cols
+            col = pos  % n_cols
+            logger.info(f"Plotting composite {calc}/{j} in pos {pos} at coordinates {row, col}...")
+            ax = fig.add_subplot(gs[row, col])
+            unique_iteration_count = len([c for c in computation.cycles if c.is_copy is False])
+            for cycle_idx, cycle in enumerate(computation.cycles):
+                if cycle.is_copy:
+                    continue
+                ax.plot(
+                    band_freqs,
+                    cycle.composites[j].mag_response,
+                    color=colors[cycle_idx],
+                    linewidth=2 if cycle_idx == unique_iteration_count - 1 else 1,
+                    alpha=0.8 if cycle_idx == unique_iteration_count - 1 else 0.5,
+                    label=f"Iter {cycle.iteration}",
+                )
 
-        # Plot each iteration for this composite
-        for cycle_idx, cycle in enumerate(computation.cycles):
-            composite = cycle.composites[comp_id]
+            # Formatting
+            ax.set_xlabel("Frequency (Hz)")
+            ax.set_ylabel("Magnitude (dB)")
+            ax.set_title(f"Composite {pos} ({len(computation.cycles[-1].composites[j].assigned_entry_ids)})")
+            ax.grid(True, which='both', alpha=0.3)
+            # ax.set_xscale("log")
+            ax.xaxis.set_major_formatter(StrMethodFormatter('{x:.0f}'))
+            ax.xaxis.set_minor_formatter(StrMethodFormatter('{x:.0f}'))
+            ax.xaxis.set_tick_params(which='both', labelsize=6)
 
-            # Plot the composite curve
-            ax.plot(
-                band_freqs,
-                composite.mag_response,
-                color=colors[cycle_idx],
-                linewidth=2 if cycle_idx == n_iterations - 1 else 1,
-                alpha=0.8 if cycle_idx == n_iterations - 1 else 0.5,
-                label=f"Iter {cycle.iteration}",
-            )
-
-        # Get the final assignment count
-        final_composite = computation.cycles[-1].composites[comp_id]
-        n_assigned = len(final_composite.assigned_entry_ids)
-
-        # Formatting
-        ax.set_xlabel("Frequency (Hz)")
-        ax.set_ylabel("Magnitude (dB)")
-        ax.set_title(f"Composite {comp_id + 1} ({n_assigned})")
-        ax.grid(True, which='both', alpha=0.3)
-        ax.set_xscale("log")
-        ax.xaxis.set_major_formatter(StrMethodFormatter('{x:.0f}'))
-        ax.xaxis.set_minor_formatter(StrMethodFormatter('{x:.0f}'))
-        ax.xaxis.set_tick_params(which='both', labelsize=6)
-
-        # Add legend only to the first subplot
-        if comp_id == 0:
-            ax.legend(loc="best", fontsize=8, framealpha=0.9)
+            # Add legend only to the first subplot
+            if pos == 0:
+                ax.legend(loc="best", fontsize=8, framealpha=0.9)
 
     # Overall title
     fig.suptitle("Composite Evolution", y=0.98)
@@ -196,7 +188,7 @@ def plot_assigned_fan_curves(
             ax.set_xlabel("Frequency (Hz)")
 
         ax.grid(True, which='both', alpha=0.3)
-        ax.set_xscale("log")
+        # ax.set_xscale("log")
         ax.xaxis.set_major_formatter(StrMethodFormatter('{x:.0f}'))
         ax.xaxis.set_minor_formatter(StrMethodFormatter('{x:.0f}'))
         ax.xaxis.set_tick_params(which='both', labelsize=6)

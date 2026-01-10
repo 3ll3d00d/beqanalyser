@@ -940,7 +940,7 @@ def assign_remaining_entries(
     for composite_id, count in previously_assigned_counts_by_composite.items():
         new_count = newly_assigned_counts_by_composite[composite_id]
         logger.info(
-            f"  {composite_id}: {count} + {new_count} = {count + new_count} entries assigned (+{new_count / (count + new_count):.1%}"
+            f"  {composite_id}: {count} + {new_count} = {count + new_count} entries assigned (+{new_count / (count + new_count):.1%})"
         )
 
     newly_assigned = sum(newly_assigned_counts_by_composite.values())
@@ -965,6 +965,7 @@ def compute_next_cycle(
     next_composites = [BEQComposite(c.id, _compute(c)) for c in cycle.composites]
     next_cycle = ComputationCycle(cycle.iteration + 1, next_composites)
     if copy_forward:
+        next_cycle.is_copy = True
         for comp in next_composites:
             comp.mappings = [
                 copy.deepcopy(m) for m in cycle.composites[comp.id].mappings
@@ -1008,50 +1009,20 @@ def compute_fan_curves(
                 comp.fan_envelopes.append(np.array([comp.mag_response]))
 
 
-# ------------------------------
-# Full pipeline
-# ------------------------------
-def build_all_composites(
+def compute_distance_matrix(
     input_curves: np.ndarray,
     freqs: np.ndarray,
     distance_params: DistanceParams,
-    iteration_params: list[HDBSCANParams],
-    weights: np.ndarray | None = None,
     band: tuple[float, float] = (5, 50),
-    fan_counts: tuple[int, ...] = (5,),
-    max_iterations: int = 20,
-    min_reject_rate_delta: float = 0.005,
-    final_assignment_threshold_multiplier: float = 1.5,
-) -> BEQResult:
+) -> np.ndarray:
     """
-    Build BEQ composite filters via an iterative HDBSCAN clustering with final assignment phase.
-
-    This function now precomputes the full distance matrix once and reuses it across all
-    iterations by extracting relevant submatrices.
-
-    Args:
-        input_curves: Full frequency response database
-        freqs: Frequency array.
-        distance_params: Parameters controlling distance computation and limits
-        iteration_params: parameters for each iteration, predominantly aimed at hdbscan configuration.
-        weights: Optional frequency weights
-        band: Frequency band to analyse (min_freq, max_freq)
-        fan_counts: Number of curves in each fan level
-        max_iterations: Maximum refinement iterations per HDBSCAN run
-        min_reject_rate_delta: Minimum change in reject rate to continue iterating
-        final_assignment_threshold_multiplier: Multiplier for the distance threshold in final assignment.
-
-    Returns:
-        a BEQResult object containing all cycles and final composites
+    Precompute the full distance matrix once.
+    :param input_curves:the catalogue of responses.
+    :param freqs: the frequency array.
+    :param distance_params: the distance parameters.
+    :param band: the frequency band to analyze.
+    :return: the matrix.
     """
-    calcs: list[BEQCompositeComputation] = []
-    weights = weights if weights is not None else np.ones_like(freqs)
-    assigned_rate = 1.0
-    param_idx = 0
-
-    all_entry_ids = list(range(0, input_curves.shape[0]))
-
-    # Precompute the full distance matrix once for all iterations
     band_mask = (freqs >= band[0]) & (freqs <= band[1])
     full_masked_catalogue = input_curves[:, band_mask]
 
@@ -1094,6 +1065,57 @@ def build_all_composites(
         f"Matrix shape: {full_distance_matrix.shape}, size: {full_distance_matrix.nbytes / 1024 / 1024:.2f} MB"
     )
 
+    return full_distance_matrix
+
+
+# ------------------------------
+# Full pipeline
+# ------------------------------
+def build_all_composites(
+    input_curves: np.ndarray,
+    freqs: np.ndarray,
+    full_distance_matrix: np.ndarray,
+    distance_params: DistanceParams,
+    iteration_params: list[HDBSCANParams],
+    weights: np.ndarray | None = None,
+    band: tuple[float, float] = (5, 50),
+    fan_counts: tuple[int, ...] = (5,),
+    max_iterations: int = 20,
+    min_reject_rate_delta: float = 0.005,
+    final_assignment_threshold_multiplier: float = 1.0,
+) -> BEQResult:
+    """
+    Build BEQ composite filters via an iterative HDBSCAN clustering with final assignment phase.
+
+    This function now precomputes the full distance matrix once and reuses it across all
+    iterations by extracting relevant submatrices.
+
+    Args:
+        input_curves: Full frequency response database
+        freqs: Frequency array.
+        full_distance_matrix: Precomputed full distance matrix.
+        distance_params: Parameters controlling distance computation and limits
+        iteration_params: parameters for each iteration, predominantly aimed at hdbscan configuration.
+        weights: Optional frequency weights
+        band: Frequency band to analyse (min_freq, max_freq)
+        fan_counts: Number of curves in each fan level
+        max_iterations: Maximum refinement iterations per HDBSCAN run
+        min_reject_rate_delta: Minimum change in reject rate to continue iterating
+        final_assignment_threshold_multiplier: Multiplier for the distance threshold in final assignment.
+
+    Returns:
+        a BEQResult object containing all cycles and final composites
+    """
+    calcs: list[BEQCompositeComputation] = []
+    weights = weights if weights is not None else np.ones_like(freqs)
+    assigned_rate = 1.0
+    param_idx = 0
+
+    all_entry_ids = list(range(0, input_curves.shape[0]))
+
+    band_mask = (freqs >= band[0]) & (freqs <= band[1])
+    full_masked_catalogue = input_curves[:, band_mask]
+
     # Phase 1: Discovery - iteratively find clusters, keep noise as rejected
     logger.info("")
     logger.info("=" * 80)
@@ -1123,8 +1145,7 @@ def build_all_composites(
             hdbscan_params=iteration_params[param_idx],
             max_iterations=max_iterations,
             min_reject_rate_delta=min_reject_rate_delta,
-            assign_noise_points=False,  # Keep noise as rejected during discovery
-            precomputed_distance_matrix=full_distance_matrix,  # Pass precomputed matrix
+            precomputed_distance_matrix=full_distance_matrix,
         )
         calcs.append(last_calc)
         assigned_count = sum([a.total_assigned_count for a in calcs])
@@ -1193,7 +1214,6 @@ def build_beq_composites(
     fan_counts: tuple[int, ...] = (5,),
     max_iterations: int = 10,
     min_reject_rate_delta: float = 0.005,
-    assign_noise_points: bool = True,
     precomputed_distance_matrix: np.ndarray | None = None,
 ) -> BEQCompositeComputation:
     """
@@ -1209,7 +1229,6 @@ def build_beq_composites(
         fan_counts: Number of curves in each fan level
         max_iterations: Maximum refinement iterations
         min_reject_rate_delta: Minimum change in reject rate to continue iterating
-        assign_noise_points: whether noise points should be considered for assignment
         precomputed_distance_matrix: Optional precomputed distance matrix for full catalogue
 
     Returns:
@@ -1256,15 +1275,10 @@ def build_beq_composites(
     n_noise = np.sum(labels == -1)
     in_scope_catalogue_size = scoped_masked_catalogue[labels != -1].shape[0]
     if n_noise > 0:
-        if not assign_noise_points:
-            old_cat_size = scoped_masked_catalogue.shape[0]
-            logger.info(
-                f"Ignoring noise: catalogue reduced from {old_cat_size} entries to {in_scope_catalogue_size}"
-            )
-        else:
-            logger.info(
-                f"Assigning noise: {n_noise} noise points will be assigned during iteration"
-            )
+        old_cat_size = scoped_masked_catalogue.shape[0]
+        logger.info(
+            f"Ignoring noise: catalogue reduced from {old_cat_size} entries to {in_scope_catalogue_size}"
+        )
     else:
         logger.info("No noise points found, entire catalogue will be assigned")
 

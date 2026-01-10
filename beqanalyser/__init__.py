@@ -812,6 +812,7 @@ class BEQComposite:
 class ComputationCycle:
     iteration: int
     composites: list[BEQComposite]
+    is_copy: bool = False
 
     def reject_rate(self, universe_size: int) -> float:
         return self.reject_count / universe_size
