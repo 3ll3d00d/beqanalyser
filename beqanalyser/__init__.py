@@ -1,7 +1,7 @@
 import logging
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, MISSING
 from enum import IntEnum
 
 logger = logging.getLogger()
@@ -907,3 +907,141 @@ def derivative_rms(a: np.ndarray) -> float:
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     norm = np.linalg.norm(a) * np.linalg.norm(b)
     return float(np.dot(a, b) / norm) if norm != 0 else 1.0
+
+
+@dataclass(repr=False)
+class DefaultAwareRepr:
+    def __repr__(self) -> str:
+        """
+        Constructs a string representation of the class, including only attributes that
+        are not equal to their default values or do not have a predefined baseline
+        (default value).
+
+        :return: String representation of the object with attributes and their
+                 corresponding values if they differ from the defaults.
+        :rtype: str
+        """
+
+        parts: list[str] = []
+
+        for f in fields(self):
+            value = getattr(self, f.name)
+
+            if f.default is MISSING:
+                # No baseline → always include
+                parts.append(f"{f.name}={value!r}")
+            elif value != f.default:
+                parts.append(f"{f.name}={value!r}")
+
+        if parts:
+            return f"{self.__class__.__name__}({', '.join(parts)})"
+        else:
+            return f"{self.__class__.__name__}(all defaults)"
+
+
+@dataclass(slots=True, repr=False)
+class DistanceParams(DefaultAwareRepr):
+    """
+    Configuration parameters for distance computation used during BEQ composite construction.
+    """
+
+    # --- Acceptance / rejection limits ---
+
+    rms_limit: float = 10.0
+    """Maximum acceptable RMS deviation for assignment."""
+
+    max_limit: float = 10.0
+    """Maximum acceptable absolute deviation."""
+
+    cosine_limit: float = 0.90
+    """Minimum acceptable cosine similarity."""
+
+    derivative_limit: float = 1.0
+    """Maximum acceptable derivative RMS."""
+
+    # --- Distance computation configuration ---
+
+    distance_chunk_size: int = 1000
+    """
+    Chunk size for distance computation
+    (lower = less memory usage, default: 1000).
+    """
+
+    distance_rms_weight: float = 0.8
+    """Weight for RMS component in distance metric."""
+
+    distance_cosine_weight: float = 0.2
+    """Weight for cosine similarity component in distance metric."""
+
+    distance_cosine_scale: float = 10.0
+    """
+    Scaling factor applied to cosine distance to match RMS magnitude.
+    """
+
+    # --- Constraint / penalty handling ---
+
+    use_constraints: bool = True
+    """
+    If True, penalize curve pairs that violate acceptance criteria
+    (e.g. RMS, max, cosine limits).
+    """
+
+    distance_penalty_scale: float = 100.0
+    """
+    Hard penalty multiplier applied to constraint violations.
+    """
+
+    distance_rms_undershoot_tolerance: float = 2.0
+    """
+    Tolerance factor for RMS undershoot before penalties are applied.
+    """
+
+    distance_rms_close_threshold: float = 2.0
+    """
+    RMS threshold below which cosine similarity is boosted.
+    """
+
+    distance_cosine_boost_in_close_range: float = 2.0
+    """
+    Multiplier applied to cosine weight when curves are RMS-close.
+    """
+
+    # --- Soft limiting ---
+
+    distance_soft_limit_factor: float = 0.7
+    """
+    Soft limit expressed as a fraction of the hard rejection limit.
+    """
+
+    distance_soft_penalty_scale: float = 10.0
+    """
+    Penalty multiplier applied when soft limits are exceeded.
+    """
+
+    # --- Parallelism ---
+
+    distance_n_jobs: int = -1
+    """
+    Number of parallel jobs for distance computation
+    (-1 = use all available CPUs).
+    """
+
+
+@dataclass(slots=True, repr=False)
+class HDBSCANParams(DefaultAwareRepr):
+    """
+    Configuration parameters for HDBSCAN-based clustering and custom
+    distance computation used during BEQ composite construction.
+
+    This groups all HDBSCAN-related knobs, including clustering behaviour,
+    distance weighting, constraint handling, and parallelism.
+    """
+
+    min_cluster_size: int = 500
+    """Minimum cluster size for HDBSCAN (controls number of clusters)."""
+
+    min_samples: int | None = 50
+    """Minimum samples for core points (controls cluster density)."""
+
+    cluster_selection_epsilon: float = 0.0
+    """Distance threshold for merging clusters (0.0 = no merging)."""

@@ -93,8 +93,8 @@ def plot_composite_evolution(
         figsize = (n_cols * 5, n_rows * 4)
 
     # Create figure and subplots
-    fig = plt.figure(figsize=figsize)
-    gs = GridSpec(n_rows, n_cols, figure=fig, hspace=0.3, wspace=0.3)
+    fig, all_ax = plt.subplots(n_rows, n_cols, sharex=True, sharey=True, figsize=figsize)
+    axes = np.array(all_ax).flatten() if n_cols * n_rows > 1 else np.array([all_ax])
 
     # Colour map for iterations
     colors = plt.cm.viridis(np.linspace(0, 1, n_iterations))
@@ -102,6 +102,7 @@ def plot_composite_evolution(
     # Plot each composite
     pos = -1
     calc = -1
+
     for computation in result.calculations:
         calc += 1
         for j in range(len(computation.result.composites)):
@@ -109,7 +110,7 @@ def plot_composite_evolution(
             row = pos // n_cols
             col = pos  % n_cols
             logger.info(f"Plotting composite {calc}/{j} in pos {pos} at coordinates {row, col}...")
-            ax = fig.add_subplot(gs[row, col])
+            ax = axes[pos]
             unique_iteration_count = len([c for c in computation.cycles if c.is_copy is False])
             for cycle_idx, cycle in enumerate(computation.cycles):
                 if cycle.is_copy:
@@ -124,8 +125,10 @@ def plot_composite_evolution(
                 )
 
             # Formatting
-            ax.set_xlabel("Frequency (Hz)")
-            ax.set_ylabel("Magnitude (dB)")
+            if row == n_rows - 1:
+                ax.set_xlabel("Frequency (Hz)")
+            if col == 0:
+                ax.set_ylabel("Magnitude (dB)")
             ax.set_title(f"Composite {pos} ({len(computation.cycles[-1].composites[j].assigned_entry_ids)})")
             ax.grid(True, which='both', alpha=0.3)
             # ax.set_xscale("log")
@@ -139,6 +142,7 @@ def plot_composite_evolution(
 
     # Overall title
     fig.suptitle("Composite Evolution", y=0.98)
+    fig.tight_layout(rect=[0, 0, 0.95, 0.95])
 
     # Save or show
     if save_path:
@@ -148,6 +152,13 @@ def plot_composite_evolution(
         plt.show()
 
     plt.close(fig)
+
+
+def plot_distance_by_composite(
+        composites: list[BEQComposite], freqs: np.ndarray
+) -> None:
+    """Plot distance  and composite shapes."""
+    pass
 
 
 def plot_assigned_fan_curves(
@@ -194,15 +205,14 @@ def plot_assigned_fan_curves(
         ax.xaxis.set_tick_params(which='both', labelsize=6)
         # ax.set_ylim(bottom=0)
 
-        # Inset histogram for RMS of assigned curves
-        inset = ax.inset_axes([0.65, 0.65, 0.32, 0.32])
-        assigned_rms = np.array(
-            [m.rms_delta for m in comp.mappings if m.is_best and not m.rejected]
+        # Inset histogram for distance of assigned curves
+        distance_scores = np.array(
+            [m.distance_score for m in comp.mappings if m.is_best and not m.rejected]
         )
-        if len(assigned_rms) > 0:
-            inset.hist(assigned_rms, bins=15, color="lightblue", alpha=0.7)
-        inset.set_title("Assigned RMS", fontsize=8)
-        inset.tick_params(axis="both", labelsize=6)
+        if len(distance_scores) > 0:
+            inset = ax.inset_axes([0.65, 0.65, 0.32, 0.32])
+            inset.hist(distance_scores, bins=15, color="lightblue", alpha=0.7)
+            inset.tick_params(axis="both", labelsize=6)
 
     # delete axes from all but the 1st column
     for j in range(comp.id + 1, nrows * ncols):
@@ -215,128 +225,7 @@ def plot_assigned_fan_curves(
     plt.show()
 
 
-def plot_rejected_by_reason(
-    catalogue: np.ndarray, computation: BEQCompositeComputation, freqs: np.ndarray
-) -> None:
-    """Plot rejected curves per rejection reason with metric-specific histograms."""
-    n_comps = len(computation.result.composites)
-    ncols = min(3, n_comps)
-    nrows = (n_comps + ncols - 1) // ncols
-    reasons = list(RejectionReason)
-    reject_counts = computation.result.reject_reason_counts
-
-    for reason in reasons:
-        if reject_counts[reason] == 0:
-            continue
-
-        fig, axes = plt.subplots(
-            nrows, ncols, figsize=(5 * ncols, 3 * nrows), sharex=True, sharey=True
-        )
-        axes = np.array(axes).flatten() if n_comps > 1 else np.array([axes])
-
-        for comp in computation.result.composites:
-            ax: Axes = axes[comp.id]
-
-            rejected_entries = comp.rejected_mappings_for_reason(reason, best_only=True)
-            if not rejected_entries:
-                continue
-
-            curves = catalogue[[i.entry_id for i in rejected_entries]]
-
-            # Fan-style plotting
-            rms_vals = np.array([i.rms_delta for i in rejected_entries])
-            sort_idx = np.argsort(rms_vals)
-            for j, idx_r in enumerate(sort_idx):
-                alpha = 0.2 + 0.3 * j / max(1, len(sort_idx) - 1)
-                ax.plot(
-                    freqs,
-                    curves[idx_r],
-                    color="lightcoral",
-                    lw=1,
-                    alpha=alpha,
-                    zorder=1,
-                )
-
-            # Composite overlay
-            ax.plot(freqs, comp.mag_response, color="black", lw=2, zorder=2)
-
-            # Inset histogram for metric that triggered rejection
-            inset = ax.inset_axes([0.65, 0.65, 0.32, 0.32])
-            if reason == RejectionReason.RMS_EXCEEDED:
-                inset.hist(rms_vals, bins=15, color="lightblue", alpha=0.7)
-                inset.set_title("RMS", fontsize=8)
-            elif reason == RejectionReason.MAX_EXCEEDED:
-                vals = np.array([i.max_delta for i in rejected_entries])
-                inset.hist(vals, bins=15, color="salmon", alpha=0.7)
-                inset.set_title("Max", fontsize=8)
-            elif reason == RejectionReason.RMS_MAX_EXCEEDED:
-                max_vals = np.array([i.max_delta for i in rejected_entries])
-                inset.hist(rms_vals, bins=15, color="lightblue", alpha=0.7, label="RMS")
-                inset.hist(max_vals, bins=15, color="salmon", alpha=0.7, label="Max")
-                inset.set_title("RMS/Max", fontsize=8)
-                inset.legend(fontsize=6)
-            elif reason == RejectionReason.COSINE_TOO_LOW:
-                vals = np.array([1 - i.cosine_similarity for i in rejected_entries])
-                inset.hist(vals, bins=15, color="violet", alpha=0.7)
-                inset.set_title("1 - Cosine", fontsize=8)
-            elif reason == RejectionReason.DERIVATIVE_TOO_HIGH:
-                vals = np.array([i.derivative_delta for i in rejected_entries])
-                inset.hist(vals, bins=15, color="orange", alpha=0.7)
-                inset.set_title("Derivative", fontsize=8)
-
-            inset.tick_params(axis="both", labelsize=6)
-            ax.set_title(f"Composite {comp.id} ({len(rejected_entries)} rejected)")
-            ax.grid(True, alpha=0.3)
-            if comp.id % ncols == 0:
-                ax.set_ylabel("Magnitude (dB)")
-            if comp.id >= ncols * (nrows - 1):
-                ax.set_xlabel("Frequency (Hz)")
-
-        for j in range(comp.id + 1, nrows * ncols):
-            fig.delaxes(axes[j])
-
-        fig.suptitle(
-            f"Rejected Curves by Composite — Reason: {reason.name}", fontsize=14
-        )
-        fig.tight_layout(rect=[0, 0, 1, 0.95])
-
-    plt.show()
-
-
-# ------------------------------
-# RMS vs Max scatter with density
-# ------------------------------
-def plot_rms_max_scatter(composites: list[BEQComposite]) -> None:
-    all_rms: np.ndarray = np.array(
-        [
-            m.rms_delta
-            for c in composites
-            for m in c.mappings
-            if m.is_best
-        ]
-    )
-    all_max: np.ndarray = np.array(
-        [
-            m.max_delta
-            for c in composites
-            for m in c.mappings
-            if m.is_best
-        ]
-    )
-
-    xy: np.ndarray = np.vstack([all_rms, all_max])
-    kde: np.ndarray = gaussian_kde(xy)(xy)
-
-    plt.figure(figsize=(6, 5))
-    plt.scatter(all_rms, all_max, c=kde, s=20, cmap="viridis")
-    plt.xlabel("RMS deviation (dB)")
-    plt.ylabel("Max deviation (dB)")
-    plt.title("RMS vs Max-deviation scatter with density")
-    plt.grid(True, alpha=0.3)
-    plt.show()
-
-
-def plot_histograms(composites: list[BEQComposite]) -> None:
+def plot_distance_histograms(composites: list[BEQComposite]) -> None:
     rms_vals: list[float] = [
         m.rms_delta
         for c in composites
@@ -361,10 +250,15 @@ def plot_histograms(composites: list[BEQComposite]) -> None:
         for m in c.mappings
         if m.derivative_delta is not None and m.is_best
     ]
+    distance_vals: list[float] = [
+        m.distance_score
+        for c in composites
+        for m in c.mappings
+        if m.is_best
+    ]
 
     fig: Figure
-    axes: np.ndarray
-    fig, axes = plt.subplots(1, 4, figsize=(12, 5))
+    fig,  ((ax1, ax2, ax3), (ax4, ax5, ax6)) = plt.subplots(2, 3, figsize=(12, 5))
 
     # Helper to add percentile lines and annotate them slightly offset
     def add_percentile_lines(ax, data):
@@ -384,38 +278,38 @@ def plot_histograms(composites: list[BEQComposite]) -> None:
             )
 
     # RMS histogram
-    i = 0
-    axes[i].hist(rms_vals, bins=100, color="skyblue", edgecolor="black")
-    axes[i].set_xlabel("RMS deviation (dB)")
-    axes[i].set_ylabel("Count")
-    axes[i].set_title("RMS deviation")
-    add_percentile_lines(axes[i], rms_vals)
+    ax1.hist(rms_vals, bins=100, color="skyblue", edgecolor="black")
+    ax1.set_xlabel("RMS deviation (dB)")
+    ax1.set_ylabel("Count")
+    add_percentile_lines(ax1, rms_vals)
 
     # Max deviation histogram
-    i = i + 1
-    axes[i].hist(max_vals, bins=100, color="salmon", edgecolor="black")
-    axes[i].set_xlabel("Max deviation (dB)")
-    axes[i].set_ylabel("Count")
-    axes[i].set_title("Max Deviation")
-    add_percentile_lines(axes[i], max_vals)
+    ax2.hist(max_vals, bins=100, color="salmon", edgecolor="black")
+    ax2.set_xlabel("Max deviation (dB)")
+    ax2.set_ylabel("Count")
+    add_percentile_lines(ax2, max_vals)
 
     # Cosine similarity histogram
-    i = i + 1
-    axes[i].hist(cosine_vals, bins=100, color="palegreen", edgecolor="black")
-    axes[i].set_xlabel("Cosine")
-    axes[i].set_ylabel("Count")
-    axes[i].set_title("Cosine Similarity")
-    axes[i].set_xlim(0.5, 1)
-    add_percentile_lines(axes[i], cosine_vals)
+    ax3.hist(cosine_vals, bins=100, color="palegreen", edgecolor="black")
+    ax3.set_xlabel("Cosine")
+    ax3.set_ylabel("Count")
+    ax3.set_xlim(0.5, 1)
+    add_percentile_lines(ax3, cosine_vals)
 
     # Cosine similarity histogram
-    i = i + 1
-    axes[i].hist(cosine_vals, bins=100, color="darkviolet", edgecolor="black")
-    axes[i].set_xlabel("Derivative Delta")
-    axes[i].set_ylabel("Count")
-    axes[i].set_title("Derivative Delta")
-    axes[i].set_xlim(0.5, 1)
-    add_percentile_lines(axes[i], derivative_deltas)
+    ax4.hist(cosine_vals, bins=100, color="darkviolet", edgecolor="black")
+    ax4.set_xlabel("Derivative Delta")
+    ax4.set_ylabel("Count")
+    ax4.set_xlim(0.5, 1)
+    add_percentile_lines(ax4, derivative_deltas)
+
+    # Distance
+    ax5.hist(distance_vals, bins=100, color="yellow", edgecolor="black")
+    ax5.set_xlabel("Distance Score")
+    ax5.set_ylabel("Count")
+    add_percentile_lines(ax5, distance_vals)
+
+    fig.delaxes(ax6)
 
     plt.tight_layout()
     plt.show()

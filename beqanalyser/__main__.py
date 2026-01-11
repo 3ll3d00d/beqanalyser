@@ -5,44 +5,19 @@ from collections import defaultdict
 import numpy as np
 
 from beqanalyser.analyser import (
-    DistanceParams,
-    HDBSCANParams,
     build_all_composites,
     compute_distance_matrix,
 )
-from beqanalyser.loader import load
+from beqanalyser import DistanceParams, HDBSCANParams
+from beqanalyser.loader import load, load_or_compute_distance_matrix
 from beqanalyser.reporter import (
     plot_assigned_fan_curves,
     plot_composite_evolution,
-    plot_histograms,
-    plot_rms_max_scatter,
+    plot_distance_histograms,
     print_assignments,
     summarise_assignments,
     summarise_result,
 )
-
-
-def load_or_compute_distance_matrix(
-    input_curves: np.ndarray,
-    freqs: np.ndarray,
-    distance_params: DistanceParams,
-    data_hash: str,
-    band: tuple[float, float] = (5, 50),
-) -> np.ndarray:
-    target_file = f"{data_hash}.npy"
-    try:
-        with open(target_file, "rb") as f:
-            return np.load(f)
-    except FileNotFoundError:
-        logging.info("Distance matrix not found in , computing...")
-        matrix = compute_distance_matrix(
-            input_curves=input_curves,
-            freqs=freqs,
-            band=band,
-            distance_params=distance_params,
-        )
-        np.save(target_file, matrix)
-        return matrix
 
 
 if __name__ == "__main__":
@@ -65,22 +40,22 @@ if __name__ == "__main__":
 
     params = [
         HDBSCANParams(
-            min_cluster_size=30, min_samples=20, cluster_selection_epsilon=10.0
+            min_cluster_size=50, min_samples=10, cluster_selection_epsilon=10.0
         ),
         HDBSCANParams(
-            min_cluster_size=30, min_samples=20, cluster_selection_epsilon=10.0
+            min_cluster_size=50, min_samples=10, cluster_selection_epsilon=10.0
         ),
         HDBSCANParams(
-            min_cluster_size=30, min_samples=20, cluster_selection_epsilon=10.0
+            min_cluster_size=50, min_samples=8, cluster_selection_epsilon=10.0
         ),
         HDBSCANParams(
-            min_cluster_size=30, min_samples=10, cluster_selection_epsilon=10.0
+            min_cluster_size=50, min_samples=5, cluster_selection_epsilon=10.0
         ),
         HDBSCANParams(
-            min_cluster_size=10, min_samples=5, cluster_selection_epsilon=10.0
+            min_cluster_size=20, min_samples=5, cluster_selection_epsilon=10.0
         ),
         HDBSCANParams(
-            min_cluster_size=10, min_samples=5, cluster_selection_epsilon=10.0
+            min_cluster_size=20, min_samples=5, cluster_selection_epsilon=10.0
         ),
     ]
 
@@ -102,20 +77,15 @@ if __name__ == "__main__":
         iteration_params=params,
         distance_params=distance_params,
         full_distance_matrix=full_distance_matrix,
-        final_assignment_threshold_multiplier=-1
+        final_assignment_threshold_multiplier=1.0
     )
 
-    plot_histograms(result.composites)
-    plot_rms_max_scatter(result.composites)
+    plot_distance_histograms(result.composites)
+    # plot_rms_max_scatter(result.composites)
     plot_assigned_fan_curves(
         result.composites, freqs[(freqs >= min_freq) & (freqs <= max_freq)]
     )
     print_assignments(result.composites, catalogue)
-    # plot_rejected_by_reason(
-    #     responses_db[:, (freqs >= min_freq) & (freqs <= max_freq)],
-    #     result[-1],
-    #     freqs[(freqs >= min_freq) & (freqs <= max_freq)],
-    # )
     summarise_result(result)
     for i, c in enumerate(result.calculations, start=1):
         summarise_assignments(i, c, level=logging.INFO)
