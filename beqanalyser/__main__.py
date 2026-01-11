@@ -4,11 +4,10 @@ from collections import defaultdict
 
 import numpy as np
 
+from beqanalyser import DistanceParams, HDBSCANParams
 from beqanalyser.analyser import (
     build_all_composites,
-    compute_distance_matrix,
 )
-from beqanalyser import DistanceParams, HDBSCANParams
 from beqanalyser.loader import load, load_or_compute_distance_matrix
 from beqanalyser.reporter import (
     plot_assigned_fan_curves,
@@ -18,7 +17,6 @@ from beqanalyser.reporter import (
     summarise_assignments,
     summarise_result,
 )
-
 
 if __name__ == "__main__":
     logging.basicConfig(
@@ -77,7 +75,7 @@ if __name__ == "__main__":
         iteration_params=params,
         distance_params=distance_params,
         full_distance_matrix=full_distance_matrix,
-        final_assignment_threshold_multiplier=1.0
+        final_assignment_threshold_multiplier=1.0,
     )
 
     plot_distance_histograms(result.composites)

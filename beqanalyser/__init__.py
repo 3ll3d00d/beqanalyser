@@ -1,11 +1,53 @@
 import logging
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field, fields, MISSING
+from dataclasses import MISSING, dataclass, field, fields
 from enum import IntEnum
 
 logger = logging.getLogger()
 TWO_WEEKS_AGO_SECONDS = 2 * 7 * 24 * 60 * 60
+
+
+@dataclass
+class BiquadCoefficients:
+    """RBJ biquad filter coefficients."""
+
+    b0: float
+    b1: float
+    b2: float
+    a0: float
+    a1: float
+    a2: float
+    filter_type: str
+    fc: float
+    gain: float
+    q: float
+
+
+@dataclass
+class FitMetrics:
+    """Metrics describing the quality of a filter fit."""
+
+    sse: float  # Sum of Squared Errors (optimiser minimisation target)
+    rms_error: float  # Root Mean Square error in dB (typical deviation)
+    max_error: float  # Maximum absolute error in dB (worst case)
+    mean_abs_error: float  # Mean absolute error in dB (average deviation)
+    n_points: int  # Number of frequency points
+    n_filters: int  # Number of filters used
+
+    def __str__(self) -> str:
+        """Human-readable summary of fit quality."""
+        return (
+            f"Fit Quality ({self.n_filters} filters, {self.n_points} points):\n"
+            f"  RMS Error:     {self.rms_error:.3f} dB  (typical deviation)\n"
+            f"  Max Error:     {self.max_error:.3f} dB  (worst case)\n"
+            f"  Mean |Error|:  {self.mean_abs_error:.3f} dB  (average magnitude)\n"
+            f"  SSE:           {self.sse:.1f}  (optimizer's raw error)"
+        )
+
+    def is_good_fit(self, rms_threshold: float = 1.0) -> bool:
+        """Check if fit quality meets threshold."""
+        return self.rms_error < rms_threshold
 
 
 class CatalogueEntry:
@@ -791,21 +833,38 @@ class BEQFilterMapping:
 class BEQComposite:
     id: int
     mag_response: np.ndarray
+    biquads: list[BiquadCoefficients] = field(default_factory=list)
     mappings: list[BEQFilterMapping] = field(default_factory=list)
     fan_envelopes: list[np.ndarray] = field(default_factory=list)
 
     @property
     def assigned_entry_ids(self) -> list[int]:
-        return [m.entry_id for m in self.mappings if m.rejection_reason is None and m.is_best]
+        return [
+            m.entry_id
+            for m in self.mappings
+            if m.rejection_reason is None and m.is_best
+        ]
 
     @property
     def rejected_entry_ids(self) -> list[int]:
-        return list(set([m.entry_id for m in self.mappings if m.rejection_reason is not None and m.is_best]))
+        return list(
+            set(
+                [
+                    m.entry_id
+                    for m in self.mappings
+                    if m.rejection_reason is not None and m.is_best
+                ]
+            )
+        )
 
     def rejected_mappings_for_reason(
         self, reason: RejectionReason, best_only: bool = False
     ) -> list[BEQFilterMapping]:
-        return [m for m in self.mappings if m.rejection_reason == reason and m.is_best == best_only]
+        return [
+            m
+            for m in self.mappings
+            if m.rejection_reason == reason and m.is_best == best_only
+        ]
 
 
 @dataclass
@@ -890,6 +949,7 @@ class BEQResult:
     @property
     def assigned_entry_ids(self) -> set[int]:
         return set([e for c in self.composites for e in c.assigned_entry_ids])
+
 
 # ------------------------------
 # Helper functions

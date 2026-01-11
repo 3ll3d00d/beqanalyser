@@ -4,37 +4,46 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
-from matplotlib.gridspec import GridSpec
 from matplotlib.ticker import StrMethodFormatter
-from scipy.stats import gaussian_kde
 
 from beqanalyser import (
     BEQComposite,
     BEQCompositeComputation,
     BEQFilter,
-    RejectionReason, BEQResult,
+    BEQResult,
+    BiquadCoefficients,
 )
+from beqanalyser.filter import CompositeCurveFitter
 
 logger = logging.getLogger()
 
+
 def summarise_result(result: BEQResult) -> None:
-    logger.info('---------------')
-    logger.info('Final Result')
-    logger.info('---------------')
+    logger.info("---------------")
+    logger.info("Final Result")
+    logger.info("---------------")
     logger.info(f"Catalogue entries: {result.input_size}")
-    logger.info(f"Assigned: {result.total_assigned_count} ({result.total_assigned_count / result.input_size:.1%})")
-    logger.info(f"Rejected: {result.total_rejected_count} ({result.total_rejected_count / result.input_size:.1%})")
+    logger.info(
+        f"Assigned: {result.total_assigned_count} ({result.total_assigned_count / result.input_size:.1%})"
+    )
+    logger.info(
+        f"Rejected: {result.total_rejected_count} ({result.total_rejected_count / result.input_size:.1%})"
+    )
 
     logger.info("Composite assignment counts:")
     for comp in result.composites:
         assigned_count = len(comp.assigned_entry_ids)
-        logger.info(f"  Composite {comp.id}: {assigned_count} assigned ({assigned_count / result.input_size:.1%})")
+        logger.info(
+            f"  Composite {comp.id}: {assigned_count} assigned ({assigned_count / result.input_size:.1%})"
+        )
 
 
-def summarise_assignments(iteration: int, computation: BEQCompositeComputation, level: int = logging.INFO) -> None:
-    logger.log(level, '---------------')
+def summarise_assignments(
+    iteration: int, computation: BEQCompositeComputation, level: int = logging.INFO
+) -> None:
+    logger.log(level, "---------------")
     logger.log(level, f"Iteration {iteration}")
-    logger.log(level, '---------------')
+    logger.log(level, "---------------")
     logger.log(level, f"Total catalogue entries: {computation.inputs.shape[0]}")
 
     logger.info("Composite assignment counts:")
@@ -82,7 +91,9 @@ def plot_composite_evolution(
 
     # Get total number of composites & max no of iterations
     n_composites = len(result.composites)
-    n_iterations = max(len([y for y in c.cycles if not y.is_copy]) for c in result.calculations)
+    n_iterations = max(
+        len([y for y in c.cycles if not y.is_copy]) for c in result.calculations
+    )
 
     # Calculate grid dimensions (try to make it roughly square)
     n_cols = int(np.ceil(np.sqrt(n_composites)))
@@ -93,7 +104,9 @@ def plot_composite_evolution(
         figsize = (n_cols * 5, n_rows * 4)
 
     # Create figure and subplots
-    fig, all_ax = plt.subplots(n_rows, n_cols, sharex=True, sharey=True, figsize=figsize)
+    fig, all_ax = plt.subplots(
+        n_rows, n_cols, sharex=True, sharey=True, figsize=figsize
+    )
     axes = np.array(all_ax).flatten() if n_cols * n_rows > 1 else np.array([all_ax])
 
     # Colour map for iterations
@@ -108,10 +121,14 @@ def plot_composite_evolution(
         for j in range(len(computation.result.composites)):
             pos += 1
             row = pos // n_cols
-            col = pos  % n_cols
-            logger.info(f"Plotting composite {calc}/{j} in pos {pos} at coordinates {row, col}...")
+            col = pos % n_cols
+            logger.info(
+                f"Plotting composite {calc}/{j} in pos {pos} at coordinates {row, col}..."
+            )
             ax = axes[pos]
-            unique_iteration_count = len([c for c in computation.cycles if c.is_copy is False])
+            unique_iteration_count = len(
+                [c for c in computation.cycles if c.is_copy is False]
+            )
             for cycle_idx, cycle in enumerate(computation.cycles):
                 if cycle.is_copy:
                     continue
@@ -129,12 +146,14 @@ def plot_composite_evolution(
                 ax.set_xlabel("Frequency (Hz)")
             if col == 0:
                 ax.set_ylabel("Magnitude (dB)")
-            ax.set_title(f"Composite {pos} ({len(computation.cycles[-1].composites[j].assigned_entry_ids)})")
-            ax.grid(True, which='both', alpha=0.3)
+            ax.set_title(
+                f"Composite {pos + 1} ({len(computation.cycles[-1].composites[j].assigned_entry_ids)})"
+            )
+            ax.grid(True, which="both", alpha=0.3)
             # ax.set_xscale("log")
-            ax.xaxis.set_major_formatter(StrMethodFormatter('{x:.0f}'))
-            ax.xaxis.set_minor_formatter(StrMethodFormatter('{x:.0f}'))
-            ax.xaxis.set_tick_params(which='both', labelsize=6)
+            ax.xaxis.set_major_formatter(StrMethodFormatter("{x:.0f}"))
+            ax.xaxis.set_minor_formatter(StrMethodFormatter("{x:.0f}"))
+            ax.xaxis.set_tick_params(which="both", labelsize=6)
 
             # Add legend only to the first subplot
             if pos == 0:
@@ -155,15 +174,13 @@ def plot_composite_evolution(
 
 
 def plot_distance_by_composite(
-        composites: list[BEQComposite], freqs: np.ndarray
+    composites: list[BEQComposite], freqs: np.ndarray
 ) -> None:
     """Plot distance  and composite shapes."""
     pass
 
 
-def plot_assigned_fan_curves(
-    composites: list[BEQComposite], freqs: np.ndarray
-) -> None:
+def plot_assigned_fan_curves(composites: list[BEQComposite], freqs: np.ndarray) -> None:
     """Plot assigned fan curves and composite shapes."""
     n_comps = len(composites)
     ncols = min(3, n_comps)
@@ -198,11 +215,11 @@ def plot_assigned_fan_curves(
         if comp.id >= ncols * (nrows - 1):
             ax.set_xlabel("Frequency (Hz)")
 
-        ax.grid(True, which='both', alpha=0.3)
+        ax.grid(True, which="both", alpha=0.3)
         # ax.set_xscale("log")
-        ax.xaxis.set_major_formatter(StrMethodFormatter('{x:.0f}'))
-        ax.xaxis.set_minor_formatter(StrMethodFormatter('{x:.0f}'))
-        ax.xaxis.set_tick_params(which='both', labelsize=6)
+        ax.xaxis.set_major_formatter(StrMethodFormatter("{x:.0f}"))
+        ax.xaxis.set_minor_formatter(StrMethodFormatter("{x:.0f}"))
+        ax.xaxis.set_tick_params(which="both", labelsize=6)
         # ax.set_ylim(bottom=0)
 
         # Inset histogram for distance of assigned curves
@@ -211,7 +228,7 @@ def plot_assigned_fan_curves(
         )
         if len(distance_scores) > 0:
             inset = ax.inset_axes([0.65, 0.65, 0.32, 0.32])
-            inset.hist(distance_scores, bins=15, color="lightblue", alpha=0.7)
+            inset.hist(distance_scores, bins=50, color="lightblue", alpha=0.7)
             inset.tick_params(axis="both", labelsize=6)
 
     # delete axes from all but the 1st column
@@ -251,14 +268,11 @@ def plot_distance_histograms(composites: list[BEQComposite]) -> None:
         if m.derivative_delta is not None and m.is_best
     ]
     distance_vals: list[float] = [
-        m.distance_score
-        for c in composites
-        for m in c.mappings
-        if m.is_best
+        m.distance_score for c in composites for m in c.mappings if m.is_best
     ]
 
     fig: Figure
-    fig,  ((ax1, ax2, ax3), (ax4, ax5, ax6)) = plt.subplots(2, 3, figsize=(12, 5))
+    fig, ((ax1, ax2, ax3), (ax4, ax5, ax6)) = plt.subplots(2, 3, figsize=(12, 5))
 
     # Helper to add percentile lines and annotate them slightly offset
     def add_percentile_lines(ax, data):
@@ -315,9 +329,7 @@ def plot_distance_histograms(composites: list[BEQComposite]) -> None:
     plt.show()
 
 
-def print_assignments(
-    composites: list[BEQComposite], filters: list[BEQFilter]
-) -> None:
+def print_assignments(composites: list[BEQComposite], filters: list[BEQFilter]) -> None:
     with open("beq_composites.csv", "w", newline="") as f:
         import csv
 
@@ -358,3 +370,250 @@ def print_assignments(
                             underlying.entry.beqc_url,
                         ]
                     )
+
+
+def plot_filter_comparison(
+    composite_curves: dict[str, tuple[np.ndarray, np.ndarray]],
+    fitted_filters: dict[str, list[BiquadCoefficients]],
+    fs: float = 48000,
+    freq_range: tuple[float, float] = (5, 50),
+    figsize: tuple[float, float] | None = None,
+    save_path: str | None = None,
+):
+    """
+    Plot composite curves and their fitted filters on a grid of subplots.
+
+    Args:
+        composite_curves: Dict mapping curve names to (freq, dB) tuples
+        fitted_filters: Dict mapping curve names to lists of BiquadCoefficients
+        fs: Sample rate in Hz
+        freq_range: Frequency range for plotting (min, max) in Hz
+        figsize: Figure size (width, height). Auto-calculated if None
+        save_path: Path to save the figure. If None, displays instead
+    """
+    n_curves = len(composite_curves)
+
+    if n_curves == 0:
+        logging.warning("No curves to plot")
+        return
+
+    # Calculate grid dimensions
+    n_cols = min(3, n_curves)  # Max 3 columns
+    n_rows = (n_curves + n_cols - 1) // n_cols
+
+    # Auto-calculate figure size if not provided
+    if figsize is None:
+        figsize = (6 * n_cols, 4 * n_rows)
+
+    fig = plt.figure(figsize=figsize)
+    from matplotlib.gridspec import GridSpec
+    gs = GridSpec(n_rows, n_cols, figure=fig, hspace=0.3, wspace=0.3)
+
+    # Generate frequency grid for fitted responses
+    freqs = np.logspace(np.log10(freq_range[0]), np.log10(freq_range[1]), 500)
+
+    # Create fitter for computing responses
+    fitter = CompositeCurveFitter(fs=fs, freq_range=freq_range)
+
+    for idx, (name, (target_freqs, target_db)) in enumerate(composite_curves.items()):
+        row = idx // n_cols
+        col = idx % n_cols
+        ax = fig.add_subplot(gs[row, col])
+
+        # Plot target curve
+        ax.semilogx(
+            target_freqs,
+            target_db,
+            "o-",
+            linewidth=2,
+            markersize=4,
+            alpha=0.7,
+            label="Target Composite",
+            color="#2E86AB",
+        )
+
+        # Plot fitted filter response if available
+        if name in fitted_filters and fitted_filters[name]:
+            biquads = fitted_filters[name]
+            fitted_response = fitter.compute_filter_response(biquads)
+            ax.semilogx(
+                fitter.freqs,
+                fitted_response,
+                "-",
+                linewidth=2,
+                label=f"Fitted ({len(biquads)} filters)",
+                color="#A23B72",
+            )
+
+            # Calculate and display RMS error
+            target_interp = np.interp(fitter.freqs, target_freqs, target_db)
+            rms_error = np.sqrt(np.mean((fitted_response - target_interp) ** 2))
+
+            # Plot individual filter contributions (optional, lighter lines)
+            if len(biquads) <= 5:  # Only show for simple cases
+                cumulative = np.zeros(len(fitter.freqs))
+                for i, bq in enumerate(biquads):
+                    response = fitter.compute_filter_response([bq])
+                    cumulative += response
+                    ax.semilogx(
+                        fitter.freqs,
+                        response,
+                        "--",
+                        linewidth=1,
+                        alpha=0.3,
+                        label=f"{bq.filter_type} @ {bq.fc:.0f}Hz",
+                    )
+        else:
+            rms_error = None
+
+        # Formatting
+        ax.grid(True, which="both", alpha=0.3, linestyle="-", linewidth=0.5)
+        ax.set_xlabel("Frequency (Hz)", fontsize=10)
+        ax.set_ylabel("Magnitude (dB)", fontsize=10)
+        ax.set_xlim(freq_range)
+
+        # Set y-axis limits with some padding
+        all_db = list(target_db)
+        if name in fitted_filters and fitted_filters[name]:
+            all_db.extend(fitted_response)
+        y_min, y_max = min(all_db), max(all_db)
+        y_range = y_max - y_min
+        ax.set_ylim(y_min - 0.1 * y_range, y_max + 0.1 * y_range)
+
+        # Title with RMS error if available
+        title = name.replace("_", " ").title()
+        if rms_error is not None:
+            title += f"\n(RMS Error: {rms_error:.2f} dB)"
+        ax.set_title(title, fontsize=11, fontweight="bold")
+
+        # Legend
+        ax.legend(fontsize=8, loc="best", framealpha=0.9)
+
+    # Remove empty subplots
+    for idx in range(n_curves, n_rows * n_cols):
+        row = idx // n_cols
+        col = idx % n_cols
+        fig.delaxes(fig.add_subplot(gs[row, col]))
+
+    plt.suptitle(
+        "BEQ Composite Curves vs Fitted Biquad Filters",
+        fontsize=14,
+        fontweight="bold",
+        y=0.995,
+    )
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        logging.info(f"Plot saved to {save_path}")
+    else:
+        plt.show()
+
+
+def plot_single_filter_detail(
+    name: str,
+    target_freqs: np.ndarray,
+    target_db: np.ndarray,
+    biquads: list[BiquadCoefficients],
+    fs: float = 48000,
+    freq_range: tuple[float, float] = (10, 200),
+    save_path: str | None = None,
+):
+    """
+    Create a detailed plot for a single filter showing individual contributions.
+
+    Args:
+        name: Name of the curve
+        target_freqs: Target frequency points
+        target_db: Target magnitude in dB
+        biquads: List of fitted biquad coefficients
+        fs: Sample rate
+        freq_range: Frequency range for plotting
+        save_path: Path to save figure
+    """
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+
+    fitter = CompositeCurveFitter(fs=fs, freq_range=freq_range)
+
+    # Top plot: Overall comparison
+    ax1.semilogx(
+        target_freqs,
+        target_db,
+        "o-",
+        linewidth=2,
+        markersize=6,
+        label="Target Composite",
+        color="#2E86AB",
+    )
+
+    if biquads:
+        fitted_response = fitter.compute_filter_response(biquads)
+        ax1.semilogx(
+            fitter.freqs,
+            fitted_response,
+            "-",
+            linewidth=2.5,
+            label="Fitted Response",
+            color="#A23B72",
+        )
+
+        # Calculate error
+        target_interp = np.interp(fitter.freqs, target_freqs, target_db)
+        error = fitted_response - target_interp
+        rms_error = np.sqrt(np.mean(error**2))
+        max_error = np.max(np.abs(error))
+
+        ax1.text(
+            0.02,
+            0.98,
+            f"RMS Error: {rms_error:.3f} dB\nMax Error: {max_error:.3f} dB",
+            transform=ax1.transAxes,
+            fontsize=10,
+            verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+        )
+
+    ax1.grid(True, which="both", alpha=0.3)
+    ax1.set_ylabel("Magnitude (dB)", fontsize=11)
+    ax1.set_title(f"{name} - Overall Fit", fontsize=12, fontweight="bold")
+    ax1.legend(fontsize=10)
+    ax1.set_xlim(freq_range)
+
+    # Bottom plot: Individual filter contributions
+    if biquads:
+        colors = plt.cm.tab10(np.linspace(0, 1, len(biquads)))
+
+        for i, (bq, color) in enumerate(zip(biquads, colors)):
+            response = fitter.compute_filter_response([bq])
+            label = f"{i + 1}. {bq.filter_type}: {bq.fc:.1f}Hz, {bq.gain:+.1f}dB, Q={bq.q:.2f}"
+            ax2.semilogx(
+                fitter.freqs, response, "-", linewidth=2, label=label, color=color
+            )
+
+        # Also plot cumulative sum
+        cumulative = np.zeros(len(fitter.freqs))
+        for bq in biquads:
+            cumulative += fitter.compute_filter_response([bq])
+        ax2.semilogx(
+            fitter.freqs,
+            cumulative,
+            "k--",
+            linewidth=2,
+            alpha=0.5,
+            label="Sum of Individual",
+        )
+
+    ax2.grid(True, which="both", alpha=0.3)
+    ax2.set_xlabel("Frequency (Hz)", fontsize=11)
+    ax2.set_ylabel("Magnitude (dB)", fontsize=11)
+    ax2.set_title("Individual Filter Contributions", fontsize=12, fontweight="bold")
+    ax2.legend(fontsize=9, loc="best", ncol=1)
+    ax2.set_xlim(freq_range)
+    ax2.axhline(y=0, color="gray", linestyle=":", linewidth=1)
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        logging.info(f"Detailed plot saved to {save_path}")
+    else:
+        plt.show()

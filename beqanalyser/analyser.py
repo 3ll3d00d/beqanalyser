@@ -12,10 +12,13 @@ from beqanalyser import (
     BEQFilterMapping,
     BEQResult,
     ComputationCycle,
+    DistanceParams,
+    HDBSCANParams,
     RejectionReason,
     cosine_similarity,
     derivative_rms,
-    rms, DistanceParams, HDBSCANParams, )
+    rms,
+)
 from beqanalyser.loader import compute_beq_distance_matrix, compute_distance_components
 
 logger = logging.getLogger(__name__)
