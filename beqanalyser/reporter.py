@@ -11,9 +11,7 @@ from beqanalyser import (
     BEQCompositeComputation,
     BEQFilter,
     BEQResult,
-    BiquadCoefficients,
 )
-from beqanalyser.filter import CompositeCurveFitter
 
 logger = logging.getLogger()
 
@@ -373,25 +371,12 @@ def print_assignments(composites: list[BEQComposite], filters: list[BEQFilter]) 
 
 
 def plot_filter_comparison(
-    composite_curves: dict[str, tuple[np.ndarray, np.ndarray]],
-    fitted_filters: dict[str, list[BiquadCoefficients]],
-    fs: float = 48000,
-    freq_range: tuple[float, float] = (5, 50),
-    figsize: tuple[float, float] | None = None,
-    save_path: str | None = None,
+    fit_results: dict,
 ):
     """
     Plot composite curves and their fitted filters on a grid of subplots.
-
-    Args:
-        composite_curves: Dict mapping curve names to (freq, dB) tuples
-        fitted_filters: Dict mapping curve names to lists of BiquadCoefficients
-        fs: Sample rate in Hz
-        freq_range: Frequency range for plotting (min, max) in Hz
-        figsize: Figure size (width, height). Auto-calculated if None
-        save_path: Path to save the figure. If None, displays instead
     """
-    n_curves = len(composite_curves)
+    n_curves = len(fit_results)
 
     if n_curves == 0:
         logging.warning("No curves to plot")
@@ -402,91 +387,54 @@ def plot_filter_comparison(
     n_rows = (n_curves + n_cols - 1) // n_cols
 
     # Auto-calculate figure size if not provided
-    if figsize is None:
-        figsize = (6 * n_cols, 4 * n_rows)
+    figsize = (6 * n_cols, 4 * n_rows)
 
     fig = plt.figure(figsize=figsize)
     from matplotlib.gridspec import GridSpec
+
     gs = GridSpec(n_rows, n_cols, figure=fig, hspace=0.3, wspace=0.3)
 
-    # Generate frequency grid for fitted responses
-    freqs = np.logspace(np.log10(freq_range[0]), np.log10(freq_range[1]), 500)
+    idx = -1
+    for id, result in fit_results.items():
+        freq_range = result['freqs']
 
-    # Create fitter for computing responses
-    fitter = CompositeCurveFitter(fs=fs, freq_range=freq_range)
+        # Generate frequency grid for fitted responses
+        freqs = np.logspace(np.log10(freq_range[0]), np.log10(freq_range[-1]), 500)
 
-    for idx, (name, (target_freqs, target_db)) in enumerate(composite_curves.items()):
+        idx += 1
         row = idx // n_cols
         col = idx % n_cols
         ax = fig.add_subplot(gs[row, col])
 
+
         # Plot target curve
         ax.semilogx(
-            target_freqs,
-            target_db,
+            freqs,
+            np.interp(freqs, freq_range, result['target_response']),
             "o-",
-            linewidth=2,
+            linewidth=1,
             markersize=4,
             alpha=0.7,
             label="Target Composite",
             color="#2E86AB",
         )
 
-        # Plot fitted filter response if available
-        if name in fitted_filters and fitted_filters[name]:
-            biquads = fitted_filters[name]
-            fitted_response = fitter.compute_filter_response(biquads)
-            ax.semilogx(
-                fitter.freqs,
-                fitted_response,
-                "-",
-                linewidth=2,
-                label=f"Fitted ({len(biquads)} filters)",
-                color="#A23B72",
-            )
-
-            # Calculate and display RMS error
-            target_interp = np.interp(fitter.freqs, target_freqs, target_db)
-            rms_error = np.sqrt(np.mean((fitted_response - target_interp) ** 2))
-
-            # Plot individual filter contributions (optional, lighter lines)
-            if len(biquads) <= 5:  # Only show for simple cases
-                cumulative = np.zeros(len(fitter.freqs))
-                for i, bq in enumerate(biquads):
-                    response = fitter.compute_filter_response([bq])
-                    cumulative += response
-                    ax.semilogx(
-                        fitter.freqs,
-                        response,
-                        "--",
-                        linewidth=1,
-                        alpha=0.3,
-                        label=f"{bq.filter_type} @ {bq.fc:.0f}Hz",
-                    )
-        else:
-            rms_error = None
+        # Plot fitted filter response
+        ax.semilogx(
+            freqs,
+            np.interp(freqs, freq_range, result['fitted_response']),
+            "-",
+            linewidth=1,
+            label=f"{len(result['filters'])} fitted",
+            color="#A23B72",
+        )
 
         # Formatting
         ax.grid(True, which="both", alpha=0.3, linestyle="-", linewidth=0.5)
         ax.set_xlabel("Frequency (Hz)", fontsize=10)
         ax.set_ylabel("Magnitude (dB)", fontsize=10)
-        ax.set_xlim(freq_range)
-
-        # Set y-axis limits with some padding
-        all_db = list(target_db)
-        if name in fitted_filters and fitted_filters[name]:
-            all_db.extend(fitted_response)
-        y_min, y_max = min(all_db), max(all_db)
-        y_range = y_max - y_min
-        ax.set_ylim(y_min - 0.1 * y_range, y_max + 0.1 * y_range)
-
-        # Title with RMS error if available
-        title = name.replace("_", " ").title()
-        if rms_error is not None:
-            title += f"\n(RMS Error: {rms_error:.2f} dB)"
-        ax.set_title(title, fontsize=11, fontweight="bold")
-
-        # Legend
+        # ax.set_xlim(freq_range)
+        ax.set_title(f'Composite {id+1}\n(RMS Error: {result['rms_error']:.2f} dB)', fontsize=11, fontweight="bold")
         ax.legend(fontsize=8, loc="best", framealpha=0.9)
 
     # Remove empty subplots
@@ -502,118 +450,4 @@ def plot_filter_comparison(
         y=0.995,
     )
 
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        logging.info(f"Plot saved to {save_path}")
-    else:
-        plt.show()
-
-
-def plot_single_filter_detail(
-    name: str,
-    target_freqs: np.ndarray,
-    target_db: np.ndarray,
-    biquads: list[BiquadCoefficients],
-    fs: float = 48000,
-    freq_range: tuple[float, float] = (10, 200),
-    save_path: str | None = None,
-):
-    """
-    Create a detailed plot for a single filter showing individual contributions.
-
-    Args:
-        name: Name of the curve
-        target_freqs: Target frequency points
-        target_db: Target magnitude in dB
-        biquads: List of fitted biquad coefficients
-        fs: Sample rate
-        freq_range: Frequency range for plotting
-        save_path: Path to save figure
-    """
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
-
-    fitter = CompositeCurveFitter(fs=fs, freq_range=freq_range)
-
-    # Top plot: Overall comparison
-    ax1.semilogx(
-        target_freqs,
-        target_db,
-        "o-",
-        linewidth=2,
-        markersize=6,
-        label="Target Composite",
-        color="#2E86AB",
-    )
-
-    if biquads:
-        fitted_response = fitter.compute_filter_response(biquads)
-        ax1.semilogx(
-            fitter.freqs,
-            fitted_response,
-            "-",
-            linewidth=2.5,
-            label="Fitted Response",
-            color="#A23B72",
-        )
-
-        # Calculate error
-        target_interp = np.interp(fitter.freqs, target_freqs, target_db)
-        error = fitted_response - target_interp
-        rms_error = np.sqrt(np.mean(error**2))
-        max_error = np.max(np.abs(error))
-
-        ax1.text(
-            0.02,
-            0.98,
-            f"RMS Error: {rms_error:.3f} dB\nMax Error: {max_error:.3f} dB",
-            transform=ax1.transAxes,
-            fontsize=10,
-            verticalalignment="top",
-            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
-        )
-
-    ax1.grid(True, which="both", alpha=0.3)
-    ax1.set_ylabel("Magnitude (dB)", fontsize=11)
-    ax1.set_title(f"{name} - Overall Fit", fontsize=12, fontweight="bold")
-    ax1.legend(fontsize=10)
-    ax1.set_xlim(freq_range)
-
-    # Bottom plot: Individual filter contributions
-    if biquads:
-        colors = plt.cm.tab10(np.linspace(0, 1, len(biquads)))
-
-        for i, (bq, color) in enumerate(zip(biquads, colors)):
-            response = fitter.compute_filter_response([bq])
-            label = f"{i + 1}. {bq.filter_type}: {bq.fc:.1f}Hz, {bq.gain:+.1f}dB, Q={bq.q:.2f}"
-            ax2.semilogx(
-                fitter.freqs, response, "-", linewidth=2, label=label, color=color
-            )
-
-        # Also plot cumulative sum
-        cumulative = np.zeros(len(fitter.freqs))
-        for bq in biquads:
-            cumulative += fitter.compute_filter_response([bq])
-        ax2.semilogx(
-            fitter.freqs,
-            cumulative,
-            "k--",
-            linewidth=2,
-            alpha=0.5,
-            label="Sum of Individual",
-        )
-
-    ax2.grid(True, which="both", alpha=0.3)
-    ax2.set_xlabel("Frequency (Hz)", fontsize=11)
-    ax2.set_ylabel("Magnitude (dB)", fontsize=11)
-    ax2.set_title("Individual Filter Contributions", fontsize=12, fontweight="bold")
-    ax2.legend(fontsize=9, loc="best", ncol=1)
-    ax2.set_xlim(freq_range)
-    ax2.axhline(y=0, color="gray", linestyle=":", linewidth=1)
-
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        logging.info(f"Detailed plot saved to {save_path}")
-    else:
-        plt.show()
+    plt.show()

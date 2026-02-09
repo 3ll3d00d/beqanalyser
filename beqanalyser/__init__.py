@@ -1,5 +1,6 @@
 import logging
 import time
+import numpy as np
 from collections import defaultdict
 from dataclasses import MISSING, dataclass, field, fields
 from enum import IntEnum
@@ -18,10 +19,29 @@ class BiquadCoefficients:
     a0: float
     a1: float
     a2: float
-    filter_type: str
-    fc: float
-    gain: float
-    q: float
+
+    def normalize(self) -> "BiquadCoefficients":
+        """Normalize coefficients so a0 = 1."""
+        return BiquadCoefficients(
+            b0=self.b0 / self.a0,
+            b1=self.b1 / self.a0,
+            b2=self.b2 / self.a0,
+            a0=1.0,
+            a1=self.a1 / self.a0,
+            a2=self.a2 / self.a0,
+        )
+
+    def to_sos(self) -> np.ndarray:
+        """Convert to second-order section format for scipy."""
+        norm = self.normalize()
+        return np.array([[norm.b0, norm.b1, norm.b2, 1.0, norm.a1, norm.a2]])
+
+    def __repr__(self) -> str:
+        norm = self.normalize()
+        return (
+            f"BiquadCoefficients(b0={norm.b0:.6f}, b1={norm.b1:.6f}, b2={norm.b2:.6f}, "
+            f"a0=1.0, a1={norm.a1:.6f}, a2={norm.a2:.6f})"
+        )
 
 
 @dataclass
