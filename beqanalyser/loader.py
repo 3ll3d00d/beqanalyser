@@ -328,6 +328,59 @@ def compute_beq_distance_matrix(
     return distance_matrix
 
 
+def compute_smooth_penalty(
+        value: np.ndarray | float,
+        soft_limit: float,
+        hard_limit: float,
+        scale: float,
+        exponent: float = 3.0
+) -> np.ndarray | float:
+    """
+    Compute a smooth exponential penalty that grows continuously.
+
+    - value <= soft_limit: penalty = 0
+    - soft_limit < value < hard_limit: penalty grows exponentially
+    - value >= hard_limit: penalty = scale
+
+    Args:
+        value: The metric value(s) to penalize
+        soft_limit: Lower threshold (no penalty below this)
+        hard_limit: Upper threshold (full penalty at/above this)
+        scale: Maximum penalty value
+        exponent: Controls steepness of exponential growth (default: 3.0)
+
+    Returns:
+        Penalty value(s) in range [0, scale]
+    """
+    if isinstance(value, np.ndarray):
+        penalty = np.zeros_like(value, dtype=np.float32)
+
+        # No penalty below soft limit
+        mask_below = value <= soft_limit
+
+        # Full penalty at or above hard limit
+        mask_above = value >= hard_limit
+        penalty[mask_above] = scale
+
+        # Smooth exponential penalty in between
+        mask_between = ~mask_below & ~mask_above
+        if np.any(mask_between):
+            t = (value[mask_between] - soft_limit) / (hard_limit - soft_limit)
+            # Normalize exponential to [0, 1] range
+            penalty[mask_between] = scale * (np.exp(exponent * t) - 1) / (np.exp(exponent) - 1)
+
+        return penalty
+    else:
+        # Scalar case
+        if value <= soft_limit:
+            return 0.0
+        elif value >= hard_limit:
+            return scale
+        else:
+            t = (value - soft_limit) / (hard_limit - soft_limit)
+            return scale * (np.exp(exponent * t) - 1) / (np.exp(exponent) - 1)
+
+
 # ------------------------------
 # Precompute distance matrix for BEQ curves
 # ------------------------------
@@ -395,134 +448,128 @@ def compute_distance_components(
         + cosine_weight_adjusted * cos_dist * params.distance_cosine_scale
     )
 
-    # 3. Tiered penalty system
+    # 3. smooth exponential penalty system
     if isinstance(base_distance, np.ndarray):
         penalty = np.zeros_like(base_distance, dtype=np.float32)
     else:
         penalty = 0.0
 
     if params.use_constraints:
-        # RMS penalties
+        # RMS penalties with smooth transitions
         if params.rms_limit is not None:
             soft_rms = params.rms_limit * params.distance_soft_limit_factor
 
-            # Soft penalty zone
-            soft_violations = (rms_vals > soft_rms) & (rms_vals <= params.rms_limit)
-            if isinstance(soft_violations, np.ndarray):
-                penalty = (
-                    penalty
-                    + soft_violations.astype(np.float32)
-                    * params.distance_soft_penalty_scale
+            # Overshoot penalties (harsh)
+            if isinstance(rms_vals, np.ndarray):
+                overshoot_mask = ~is_undershoot
+                overshoot_penalty = np.where(
+                    overshoot_mask,
+                    compute_smooth_penalty(
+                        rms_vals,
+                        soft_rms,
+                        params.rms_limit,
+                        params.distance_penalty_scale
+                    ),
+                    0.0
                 )
-            elif soft_violations:
-                penalty = penalty + params.distance_soft_penalty_scale
+                penalty = penalty + overshoot_penalty
+            else:
+                if not is_undershoot:
+                    penalty = penalty + compute_smooth_penalty(
+                        rms_vals,
+                        soft_rms,
+                        params.rms_limit,
+                        params.distance_penalty_scale
+                    )
 
-            # Hard penalty zone with asymmetric handling
-            hard_violations_overshoot = (rms_vals > params.rms_limit) & ~is_undershoot
-            if isinstance(hard_violations_overshoot, np.ndarray):
-                penalty = (
-                    penalty
-                    + hard_violations_overshoot.astype(np.float32)
-                    * params.distance_penalty_scale
+            # Undershoot penalties (reduced)
+            reduced_scale = params.distance_penalty_scale / params.distance_rms_undershoot_tolerance
+            if isinstance(rms_vals, np.ndarray):
+                undershoot_mask = is_undershoot
+                undershoot_penalty = np.where(
+                    undershoot_mask,
+                    compute_smooth_penalty(
+                        rms_vals,
+                        soft_rms,
+                        params.rms_limit,
+                        reduced_scale
+                    ),
+                    0.0
                 )
-            elif hard_violations_overshoot:
-                penalty = penalty + params.distance_penalty_scale
+                penalty = penalty + undershoot_penalty
+            else:
+                if is_undershoot:
+                    penalty = penalty + compute_smooth_penalty(
+                        rms_vals,
+                        soft_rms,
+                        params.rms_limit,
+                        reduced_scale
+                    )
 
-            # Reduced penalty for undershoot violations
-            hard_violations_undershoot = (rms_vals > params.rms_limit) & is_undershoot
-            reduced_penalty = (
-                params.distance_penalty_scale / params.distance_rms_undershoot_tolerance
-            )
-            if isinstance(hard_violations_undershoot, np.ndarray):
-                penalty = (
-                    penalty
-                    + hard_violations_undershoot.astype(np.float32) * reduced_penalty
-                )
-            elif hard_violations_undershoot:
-                penalty = penalty + reduced_penalty
-
-        # Cosine penalties
+        # Cosine penalties with smooth transitions
         if params.cosine_limit is not None:
             soft_cos = params.cosine_limit + (1.0 - params.cosine_limit) * (
-                1.0 - params.distance_soft_limit_factor
+                    1.0 - params.distance_soft_limit_factor
             )
 
-            # Soft penalty zone
-            soft_violations = (cos_sim_vals < soft_cos) & (
-                cos_sim_vals >= params.cosine_limit
-            )
-            if isinstance(soft_violations, np.ndarray):
-                penalty = (
-                    penalty
-                    + soft_violations.astype(np.float32)
-                    * params.distance_soft_penalty_scale
-                )
-            elif soft_violations:
-                penalty = penalty + params.distance_soft_penalty_scale
+            # For cosine, we penalize LOW values (dissimilarity)
+            # So we need to invert the logic: penalty when cos_sim < threshold
+            # We can use (threshold - value) as the "violation amount"
+            if isinstance(cos_sim_vals, np.ndarray):
+                # Convert to "badness" metric where higher = worse
+                cos_badness = soft_cos - cos_sim_vals
+                cos_badness = np.maximum(0, cos_badness)  # Only positive violations
 
-            # Hard penalty zone
-            hard_violations = cos_sim_vals < params.cosine_limit
-            if isinstance(hard_violations, np.ndarray):
-                penalty = (
-                    penalty
-                    + hard_violations.astype(np.float32) * params.distance_penalty_scale
-                )
-            elif hard_violations:
-                penalty = penalty + params.distance_penalty_scale
+                # Map to soft/hard limit space
+                # When cos_sim = soft_cos: badness = 0 (no penalty)
+                # When cos_sim = cosine_limit: badness = soft_cos - cosine_limit (full penalty)
+                violation_range = soft_cos - params.cosine_limit
 
-        # Max deviation penalties
+                # Compute smooth penalty
+                cos_penalty = compute_smooth_penalty(
+                    cos_badness,
+                    0.0,  # soft limit (no violation)
+                    violation_range,  # hard limit (max violation)
+                    params.distance_penalty_scale
+                )
+                penalty = penalty + cos_penalty
+            else:
+                cos_badness = max(0, soft_cos - cos_sim_vals)
+                violation_range = soft_cos - params.cosine_limit
+
+                cos_penalty = compute_smooth_penalty(
+                    cos_badness,
+                    0.0,
+                    violation_range,
+                    params.distance_penalty_scale
+                )
+                penalty = penalty + cos_penalty
+
+        # Max deviation penalties with smooth transitions
         if params.max_limit is not None:
             soft_max = params.max_limit * params.distance_soft_limit_factor
 
-            # Soft penalty zone
-            soft_violations = (max_vals > soft_max) & (max_vals <= params.max_limit)
-            if isinstance(soft_violations, np.ndarray):
-                penalty = (
-                    penalty
-                    + soft_violations.astype(np.float32)
-                    * params.distance_soft_penalty_scale
-                )
-            elif soft_violations:
-                penalty = penalty + params.distance_soft_penalty_scale
+            max_penalty = compute_smooth_penalty(
+                max_vals,
+                soft_max,
+                params.max_limit,
+                params.distance_penalty_scale
+            )
+            penalty = penalty + max_penalty
 
-            # Hard penalty zone
-            hard_violations = max_vals > params.max_limit
-            if isinstance(hard_violations, np.ndarray):
-                penalty = (
-                    penalty
-                    + hard_violations.astype(np.float32) * params.distance_penalty_scale
-                )
-            elif hard_violations:
-                penalty = penalty + params.distance_penalty_scale
-
-        # Derivative penalties
+        # Derivative penalties with smooth transitions
         if params.derivative_limit is not None and deriv_vals is not None:
             soft_deriv = params.derivative_limit * params.distance_soft_limit_factor
 
-            # Soft penalty zone
-            soft_violations = (deriv_vals > soft_deriv) & (
-                deriv_vals <= params.derivative_limit
+            deriv_penalty = compute_smooth_penalty(
+                deriv_vals,
+                soft_deriv,
+                params.derivative_limit,
+                params.distance_penalty_scale
             )
-            if isinstance(soft_violations, np.ndarray):
-                penalty = (
-                    penalty
-                    + soft_violations.astype(np.float32)
-                    * params.distance_soft_penalty_scale
-                )
-            elif soft_violations:
-                penalty = penalty + params.distance_soft_penalty_scale
+            penalty = penalty + deriv_penalty
 
-            # Hard penalty zone
-            hard_violations = deriv_vals > params.derivative_limit
-            if isinstance(hard_violations, np.ndarray):
-                penalty = (
-                    penalty
-                    + hard_violations.astype(np.float32) * params.distance_penalty_scale
-                )
-            elif hard_violations:
-                penalty = penalty + params.distance_penalty_scale
-
-    # Combine base distance with penalties
+    # Combine base distance with smooth penalties
     return base_distance + penalty
 
 

@@ -6,7 +6,8 @@ cascaded biquad filters using an analytical approach optimized for bass EQ profi
 """
 
 import logging
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field, fields
 
 import numpy as np
 from scipy import optimize, signal
@@ -21,9 +22,9 @@ class BiquadFilter:
     """Complete biquad filter with parameters and coefficients."""
 
     filter_type: str  # 'lowshelf', 'peaking', 'highshelf'
-    fc: float  # Center/corner frequency in Hz
-    gain_db: float  # Gain in dB
-    q: float  # Q factor
+    fc: float = field(metadata={"fmt": "{:.1f} Hz"})  # Center/corner frequency in Hz
+    gain_db: float = field(metadata={"fmt": "{:.2f} dB"})  # Gain in dB
+    q: float = field(metadata={"fmt": "{:.3f}"})  # Q factor
     fs: float  # Sample rate in Hz
     coefficients: BiquadCoefficients
 
@@ -32,6 +33,19 @@ class BiquadFilter:
             f"BiquadFilter({self.filter_type}, fc={self.fc:.1f}Hz, "
             f"gain={self.gain_db:.2f}dB, Q={self.q:.3f})"
         )
+
+    def as_row(self):
+        row = []
+        for f in fields(self):
+            if 'fmt' in f.metadata or f.name == 'filter_type':
+                value = getattr(self, f.name)
+                fmt = f.metadata.get("fmt", "{}")
+                row.append(fmt.format(value))
+        return row
+
+    @classmethod
+    def column_labels(cls):
+        return [f.name for f in fields(cls) if 'fmt' in f.metadata or f.name == 'filter_type']
 
 
 def lowshelf_rbj(fc: float, gain_db: float, q: float, fs: float) -> BiquadCoefficients:
@@ -530,13 +544,13 @@ def optimize_cascade_globally(
         options={"maxiter": 3000, "xatol": 0.01},
     )
 
-    # Rebuild filters from optimized parameters
+    # Rebuild filters from optimised parameters
     optimized_filters = []
     for i in range(len(filter_types)):
         fc, gain, q = result.x[i * 3 : (i + 1) * 3]
-        fc = np.clip(fc, 5, 300)
-        gain = np.clip(gain, -30, 30)
-        q = np.clip(q, 0.2, 5.0)
+        fc = np.round(np.clip(fc, 5, 300), 1)
+        gain = np.round(np.clip(gain, -30, 30), 2)
+        q = np.round(np.clip(q, 0.2, 8.0), 3)
 
         if filter_types[i] == "lowshelf":
             coef = lowshelf_rbj(fc, gain, q, fs)
@@ -544,6 +558,9 @@ def optimize_cascade_globally(
             coef = peaking_rbj(fc, gain, q, fs)
         else:
             coef = highshelf_rbj(fc, gain, q, fs)
+
+        if math.fabs(gain) < 0.1:
+            continue
 
         optimized_filters.append(BiquadFilter(filter_types[i], fc, gain, q, fs, coef))
 

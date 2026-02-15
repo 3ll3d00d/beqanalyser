@@ -1,5 +1,7 @@
 import logging
+import math
 
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.axes import Axes
@@ -12,6 +14,7 @@ from beqanalyser import (
     BEQFilter,
     BEQResult,
 )
+from beqanalyser.filter import BiquadFilter
 
 logger = logging.getLogger()
 
@@ -396,7 +399,7 @@ def plot_filter_comparison(
 
     idx = -1
     for id, result in fit_results.items():
-        freq_range = result['freqs']
+        freq_range = result["freqs"]
 
         # Generate frequency grid for fitted responses
         freqs = np.logspace(np.log10(freq_range[0]), np.log10(freq_range[-1]), 500)
@@ -406,11 +409,10 @@ def plot_filter_comparison(
         col = idx % n_cols
         ax = fig.add_subplot(gs[row, col])
 
-
         # Plot target curve
-        ax.semilogx(
+        ax.plot(
             freqs,
-            np.interp(freqs, freq_range, result['target_response']),
+            np.interp(freqs, freq_range, result["target_response"]),
             "o-",
             linewidth=1,
             markersize=4,
@@ -420,9 +422,9 @@ def plot_filter_comparison(
         )
 
         # Plot fitted filter response
-        ax.semilogx(
+        ax.plot(
             freqs,
-            np.interp(freqs, freq_range, result['fitted_response']),
+            np.interp(freqs, freq_range, result["fitted_response"]),
             "-",
             linewidth=1,
             label=f"{len(result['filters'])} fitted",
@@ -433,8 +435,14 @@ def plot_filter_comparison(
         ax.grid(True, which="both", alpha=0.3, linestyle="-", linewidth=0.5)
         ax.set_xlabel("Frequency (Hz)", fontsize=10)
         ax.set_ylabel("Magnitude (dB)", fontsize=10)
+        ax.xaxis.set_major_formatter(StrMethodFormatter("{x:.0f}"))
+        ax.xaxis.set_minor_formatter(StrMethodFormatter("{x:.0f}"))
         # ax.set_xlim(freq_range)
-        ax.set_title(f'Composite {id+1}\n(RMS Error: {result['rms_error']:.2f} dB)', fontsize=11, fontweight="bold")
+        ax.set_title(
+            f"Composite {id + 1}\n(RMS Error: {result['rms_error']:.2f} dB)",
+            fontsize=11,
+            fontweight="bold",
+        )
         ax.legend(fontsize=8, loc="best", framealpha=0.9)
 
     # Remove empty subplots
@@ -449,5 +457,83 @@ def plot_filter_comparison(
         fontweight="bold",
         y=0.995,
     )
+
+    plt.show()
+
+
+def show_filters(filter_sets: dict[str, list[BiquadFilter]]):
+    n = len(filter_sets)
+
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+
+    fig, axes = plt.subplots(
+        rows, cols,
+        figsize=(6 * cols, 3 * rows),
+        constrained_layout=True
+    )
+
+    axes = axes.flatten() if n > 1 else [axes]
+
+    # Infer schema
+    first_filter = next(iter(filter_sets.values()))[0]
+    labels = first_filter.column_labels()
+    ncols = len(labels)
+
+    # Uniform column widths
+    col_widths = [1.0 / ncols] * ncols
+
+    # 🔥 Compute max row count (including header)
+    max_filters = max(len(v) for v in filter_sets.values())
+    total_rows = max_filters + 1  # +1 header
+    row_height = 0.9 / total_rows  # 0.9 = bbox height
+
+    dark = True # fix
+    cell_bg = "#222222" if dark else "white"
+    header_bg = "#333333" if dark else "#eeeeee"
+    text_color = "white" if dark else "black"
+    edge_color = "#666666" if dark else "#444444"
+
+    for ax, (title, filters) in zip(axes, filter_sets.items()):
+        ax.axis("off")
+        ax.set_title(title, fontsize=11, pad=6)
+
+        # Pad with blank rows so all tables have identical row count
+        padded_filters = list(filters)
+        while len(padded_filters) < max_filters:
+            padded_filters.append(None)
+
+        rows_data = []
+        for obj in padded_filters:
+            if obj is None:
+                rows_data.append([""] * ncols)
+            else:
+                rows_data.append(obj.as_row())
+
+        table = ax.table(
+            cellText=rows_data,
+            colLabels=labels,
+            colWidths=col_widths,
+            bbox=[0, 0, 1, 0.9]
+        )
+
+        table.auto_set_font_size(False)
+        table.set_fontsize(9)
+
+        # 🔥 Force identical row height for every cell
+        for (r, c), cell in table.get_celld().items():
+            cell.set_height(row_height)
+            cell.set_edgecolor(edge_color)
+            cell.set_linewidth(0.6)
+            cell.get_text().set_color(text_color)
+
+            if r == 0:
+                cell.set_facecolor(header_bg)
+                cell.get_text().set_weight("bold")
+            else:
+                cell.set_facecolor(cell_bg)
+
+    for ax in axes[len(filter_sets):]:
+        ax.axis("off")
 
     plt.show()
