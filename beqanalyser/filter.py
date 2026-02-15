@@ -7,6 +7,7 @@ cascaded biquad filters using an analytical approach optimized for bass EQ profi
 
 import logging
 import math
+import time
 from dataclasses import dataclass, field, fields
 
 import numpy as np
@@ -17,6 +18,13 @@ from beqanalyser import BEQComposite, BiquadCoefficients
 logger = logging.getLogger(__name__)
 
 
+def q_from_octave_bandwidth(bw: float = 1.0 / 3.0) -> float:
+    """
+    Convert octave bandwidth (measured between -3 dB points) to equivalent peaking filter Q.
+    """
+    return 1.0 / (2 ** (bw / 2) - 2 ** (-bw / 2))
+
+
 @dataclass
 class BiquadFilter:
     """Complete biquad filter with parameters and coefficients."""
@@ -25,8 +33,19 @@ class BiquadFilter:
     fc: float = field(metadata={"fmt": "{:.1f} Hz"})  # Center/corner frequency in Hz
     gain_db: float = field(metadata={"fmt": "{:.2f} dB"})  # Gain in dB
     q: float = field(metadata={"fmt": "{:.3f}"})  # Q factor
-    fs: float  # Sample rate in Hz
-    coefficients: BiquadCoefficients
+    fs: float = 48000  # Sample rate in Hz
+    coefficients: BiquadCoefficients | None = None
+
+    def __post_init__(self):
+        if self.fs and not self.coefficients:
+            if self.filter_type == "lowshelf":
+                self.coefficients = lowshelf_rbj(self.fc, self.gain_db, self.q, self.fs)
+            elif self.filter_type == "highshelf":
+                self.coefficients = highshelf_rbj(
+                    self.fc, self.gain_db, self.q, self.fs
+                )
+            elif self.filter_type == "peaking":
+                self.coefficients = peaking_rbj(self.fc, self.gain_db, self.q, self.fs)
 
     def __repr__(self) -> str:
         return (
@@ -37,7 +56,7 @@ class BiquadFilter:
     def as_row(self):
         row = []
         for f in fields(self):
-            if 'fmt' in f.metadata or f.name == 'filter_type':
+            if "fmt" in f.metadata or f.name == "filter_type":
                 value = getattr(self, f.name)
                 fmt = f.metadata.get("fmt", "{}")
                 row.append(fmt.format(value))
@@ -45,7 +64,32 @@ class BiquadFilter:
 
     @classmethod
     def column_labels(cls):
-        return [f.name for f in fields(cls) if 'fmt' in f.metadata or f.name == 'filter_type']
+        return [
+            f.name
+            for f in fields(cls)
+            if "fmt" in f.metadata or f.name == "filter_type"
+        ]
+
+
+@dataclass
+class GraphicEQBand:
+    """A single band in a graphic equaliser."""
+
+    fc: float = field(metadata={"fmt": "{:.1f} Hz"})  # Centre frequency in Hz
+    gain_db: float = field(metadata={"fmt": "{:.2f} dB"})  # Gain in dB
+    width: float = 1.0 / 3.0
+
+    def __repr__(self) -> str:
+        return f"GraphicEQ(fc={self.fc:.1f}Hz, gain={self.gain_db:.2f}dB"
+
+    def as_biquad(self, fs: float) -> BiquadFilter:
+        return BiquadFilter(
+            filter_type="peaking",
+            fc=self.fc,
+            gain_db=self.gain_db,
+            q=q_from_octave_bandwidth(self.width),
+            fs=fs,
+        )
 
 
 def lowshelf_rbj(fc: float, gain_db: float, q: float, fs: float) -> BiquadCoefficients:
@@ -251,8 +295,7 @@ def fit_single_lowshelf(
 
         try:
             # Generate filter response
-            coef = lowshelf_rbj(fc, gain, q, fs)
-            filt = BiquadFilter("lowshelf", fc, gain, q, fs, coef)
+            filt = BiquadFilter("lowshelf", fc, gain, q, fs)
             response = compute_filter_response([filt], freqs, fs)
 
             # Weighted error - prioritize the transition region
@@ -335,8 +378,7 @@ def fit_single_lowshelf(
     gain_opt = np.clip(gain_opt, -30, 30)
     q_opt = np.clip(q_opt, 0.2, 5.0)
 
-    coef = lowshelf_rbj(fc_opt, gain_opt, q_opt, fs)
-    return BiquadFilter("lowshelf", fc_opt, gain_opt, q_opt, fs, coef)
+    return BiquadFilter("lowshelf", fc_opt, gain_opt, q_opt, fs)
 
 
 def fit_peaking_to_residual(
@@ -377,8 +419,7 @@ def fit_peaking_to_residual(
             return 1e10
 
         try:
-            coef = peaking_rbj(fc, gain, q, fs)
-            filt = BiquadFilter("peaking", fc, gain, q, fs, coef)
+            filt = BiquadFilter("peaking", fc, gain, q, fs)
             response = compute_filter_response([filt], freqs, fs)
 
             # Focus on region around peak
@@ -396,12 +437,10 @@ def fit_peaking_to_residual(
     )
 
     fc_opt, gain_opt, q_opt = result.x
-    coef = peaking_rbj(fc_opt, gain_opt, q_opt, fs)
-
-    return BiquadFilter("peaking", fc_opt, gain_opt, q_opt, fs, coef)
+    return BiquadFilter("peaking", fc_opt, gain_opt, q_opt, fs)
 
 
-def fit_composite_curve(
+def fit_composite_to_peq(
     mag_db: np.ndarray,
     freqs: np.ndarray,
     fs: float = 48000.0,
@@ -517,16 +556,7 @@ def optimize_cascade_globally(
                 return 1e10
 
             try:
-                if filter_types[i] == "lowshelf":
-                    coef = lowshelf_rbj(fc, gain, q, fs)
-                elif filter_types[i] == "peaking":
-                    coef = peaking_rbj(fc, gain, q, fs)
-                else:
-                    coef = highshelf_rbj(fc, gain, q, fs)
-
-                filters_temp.append(
-                    BiquadFilter(filter_types[i], fc, gain, q, fs, coef)
-                )
+                filters_temp.append(BiquadFilter(filter_types[i], fc, gain, q, fs))
             except:
                 return 1e10
 
@@ -552,23 +582,16 @@ def optimize_cascade_globally(
         gain = np.round(np.clip(gain, -30, 30), 2)
         q = np.round(np.clip(q, 0.2, 8.0), 3)
 
-        if filter_types[i] == "lowshelf":
-            coef = lowshelf_rbj(fc, gain, q, fs)
-        elif filter_types[i] == "peaking":
-            coef = peaking_rbj(fc, gain, q, fs)
-        else:
-            coef = highshelf_rbj(fc, gain, q, fs)
-
         if math.fabs(gain) < 0.1:
             continue
 
-        optimized_filters.append(BiquadFilter(filter_types[i], fc, gain, q, fs, coef))
+        optimized_filters.append(BiquadFilter(filter_types[i], fc, gain, q, fs))
 
     return optimized_filters
 
 
-def fit_all_composites(
-    composites: list[BEQComposite],  # List of BEQComposite objects
+def fit_all_composites_to_peq(
+    composites: list[BEQComposite],
     freqs: np.ndarray,
     fs: float = 48000.0,
     max_filters: int = 4,
@@ -595,9 +618,55 @@ def fit_all_composites(
         )
 
         # Fit filters to this composite
-        filters: list[BiquadFilter] = fit_composite_curve(
+        filters: list[BiquadFilter] = fit_composite_to_peq(
             comp.mag_response, freqs, fs, max_filters, residual_threshold
         )
+
+        # Compute final fit quality
+        fitted_response: np.ndarray = compute_filter_response(filters, freqs, fs)
+        rms_error = float(np.sqrt(np.mean((fitted_response - comp.mag_response) ** 2)))
+        max_error = float(np.max(np.abs(fitted_response - comp.mag_response)))
+
+        logger.info(
+            f"  Final fit: {len(filters)} filters, "
+            f"RMS error={rms_error:.3f}dB, max error={max_error:.3f}dB"
+        )
+
+        results[comp.id] = {
+            "freqs": freqs,
+            "filters": filters,
+            "rms_error": rms_error,
+            "max_error": max_error,
+            "target_response": comp.mag_response,
+            "fitted_response": fitted_response,
+        }
+
+    return results
+
+
+def fit_all_composites_to_geq(
+    composites: list[BEQComposite], freqs: np.ndarray, fs: float = 48000.0, smoothing: float = 1.0
+) -> dict:
+    """
+    Fit graphic eq filters to all composite curves from BEQ analysis.
+
+    Args:
+        composites: List of BEQComposite objects from analyser.py
+        freqs: Frequency array in Hz (should match the band used in analysis)
+        fs: Sample rate in Hz
+
+    Returns:
+        Dictionary mapping composite_id to list of BiquadFilter objects
+    """
+    results = {}
+
+    for comp in composites:
+        logger.info(
+            f"Fitting composite {comp.id} ({len(comp.assigned_entry_ids)} entries)"
+        )
+
+        # Fit filters to this composite
+        filters: list[BiquadFilter] = fit_composite_to_geq(comp.mag_response, freqs, fs, smoothing=smoothing)
 
         # Compute final fit quality
         fitted_response: np.ndarray = compute_filter_response(filters, freqs, fs)
@@ -657,48 +726,163 @@ def export_filters_to_text(results: dict, freqs: np.ndarray) -> str:
     return "\n".join(output)
 
 
-# Example usage
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+def generate_third_octave_frequencies(
+    start_freq: float = 5.0, end_freq: float = 200.0
+) -> list[float]:
+    """
+    Generate standard 1/3 octave band centre frequencies.
 
-    # Example: Create synthetic composite curve for testing
-    freqs = np.logspace(np.log10(5), np.log10(200), 300)
+    Args:
+        start_freq: Starting frequency in Hz
+        end_freq: Ending frequency in Hz
 
-    # Simulate a typical BEQ composite (low-shelf boost around 25-30 Hz)
-    # Using a more realistic bass boost curve
-    synthetic_composite = np.zeros_like(freqs)
+    Returns:
+        List of standard 1/3 octave frequencies
+    """
+    # Standard ISO 266 / ANSI S1.11 1/3 octave center frequencies
+    standard_freqs = [
+        5,
+        6.3,
+        8,
+        10,
+        12.5,
+        16,
+        20,
+        25,
+        31.5,
+        40,
+        50,
+        63,
+        80,
+        100,
+        125,
+        160,
+        200,
+        250,
+        315,
+        400,
+        500,
+        630,
+        800,
+        1000,
+        1250,
+        1600,
+        2000,
+        2500,
+        3150,
+        4000,
+        5000,
+        6300,
+        8000,
+        10000,
+        12500,
+        16000,
+        20000,
+    ]
+    return [f for f in standard_freqs if start_freq <= f <= end_freq]
 
-    # Main shelf component
-    for f, i in zip(freqs, range(len(freqs))):
-        if f < 25:
-            synthetic_composite[i] = 8.0  # Boost below 25 Hz
-        elif f < 50:
-            # Smooth transition
-            t = (f - 25) / 25
-            synthetic_composite[i] = 8.0 * (1 - t)
-        else:
-            synthetic_composite[i] = 0.0
 
-    # Add some ripple
-    synthetic_composite += 0.3 * np.sin(2 * np.pi * np.log10(freqs / 15))
+def fit_composite_to_geq(
+    target_db: np.ndarray,
+    target_freqs: np.ndarray,
+    fs: float = 48000.0,
+    smoothing: float = 1.0,
+) -> list[BiquadFilter]:
+    """
+    Fit a target curve using graphic EQ bands.
 
-    print("Fitting synthetic composite curve...")
-    print("=" * 80)
-    filters = fit_composite_curve(synthetic_composite, freqs, fs=48000.0, max_filters=4)
+    Args:
+        target_freqs: Frequency points of target curve (Hz)
+        target_db: Magnitude response in dB
+        fs: sample rate (Hz).
+        smoothing: Regularization to encourage smooth gain transitions (0-1)
 
-    print("\n" + "=" * 80)
-    print("FINAL RESULTS")
-    print("=" * 80)
-    print("\nFitted filters:")
-    for i, filt in enumerate(filters, 1):
-        print(f"{i}. {filt}")
-        coef = filt.coefficients.normalize()
-        print(f"   b: [{coef.b0:.8f}, {coef.b1:.8f}, {coef.b2:.8f}]")
-        print(f"   a: [1.0, {coef.a1:.8f}, {coef.a2:.8f}]")
+    Returns:
+        list of BiquadFilter
+    """
+    gain_range = [np.min(target_db) - 5, np.max(target_db) + 5]
+    log_freqs = np.logspace(
+        np.log10(np.min(target_freqs) * 0.8), np.log10(np.max(target_freqs) * 1.2), 500
+    )
+    q = q_from_octave_bandwidth()
+    band_freqs = generate_third_octave_frequencies(log_freqs[0], log_freqs[-1])
 
-    # Show results
-    fitted = compute_filter_response(filters, freqs, 48000.0)
-    rms_error = np.sqrt(np.mean((fitted - synthetic_composite) ** 2))
-    max_error = np.max(np.abs(fitted - synthetic_composite))
-    print(f"\nFinal RMS error: {rms_error:.3f} dB")
-    print(f"Final max error: {max_error:.3f} dB")
+    # Interpolate target to our frequency grid
+    target_interp = np.interp(log_freqs, target_freqs, target_db)
+
+    # Simple initial guess: sample target curve at band frequencies
+    x0 = np.interp(band_freqs, target_freqs, target_db)
+    # Clip to gain range
+    x0 = np.clip(x0, gain_range[0], gain_range[1])
+    # Set up optimisation bounds
+    bounds = [gain_range] * len(band_freqs)
+    # Pre-compute values for faster optimisation
+    w = 2 * np.pi * log_freqs / fs
+    z_inv = np.exp(-1j * w)
+    z_inv2 = z_inv**2
+
+    # Pre-compute filter parameters for each band
+    band_params = []
+    for fc in band_freqs:
+        w0 = 2 * np.pi * fc / fs
+        alpha = np.sin(w0) / (2 * q)
+        cos_w0 = np.cos(w0)
+        band_params.append((alpha, cos_w0))
+
+    def objective(gains):
+        """Optimization objective function."""
+        response = np.ones(len(w), dtype=np.complex128)
+
+        for i, gain in enumerate(gains):
+            if abs(gain) < 0.01:  # Skip near-zero gains
+                continue
+
+            alpha, cos_w0 = band_params[i]
+            A = 10 ** (gain / 40)
+
+            # Compute coefficients
+            b0 = 1 + alpha * A
+            b1 = -2 * cos_w0
+            b2 = 1 - alpha * A
+            a0 = 1 + alpha / A
+            a1 = -2 * cos_w0
+            a2 = 1 - alpha / A
+
+            # Normalize and compute response (vectorized)
+            b0_n, b1_n, b2_n = b0 / a0, b1 / a0, b2 / a0
+            a1_n, a2_n = a1 / a0, a2 / a0
+
+            h = (b0_n + b1_n * z_inv + b2_n * z_inv2) / (
+                1.0 + a1_n * z_inv + a2_n * z_inv2
+            )
+
+            response *= h
+
+        response_db = 20 * np.log10(np.abs(response))
+
+        # Primary error term
+        fit_error = np.sum((response_db - target_interp) ** 2)
+
+        # Optional smoothing penalty (penalise adjacent band differences)
+        if smoothing > 0:
+            gain_diffs = np.diff(gains)
+            smoothness_term = np.sum(gain_diffs**2)
+            return fit_error + smoothing * smoothness_term
+
+        return fit_error
+
+    # Optimize
+    logger.info(f"Starting optimization with {len(band_freqs)} bands...")
+    start_time = time.time()
+
+    result = optimize.minimize(
+        objective, x0, bounds=bounds, method="L-BFGS-B", options={"maxiter": 1000}
+    )
+
+    elapsed = time.time() - start_time
+    logger.info(f"Optimization completed in {elapsed:.3f}s")
+
+    return [
+        GraphicEQBand(freq, gain).as_biquad(fs)
+        for freq, gain in zip(band_freqs, result.x)
+    ]

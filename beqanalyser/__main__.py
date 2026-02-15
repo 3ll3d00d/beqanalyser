@@ -8,6 +8,7 @@ from beqanalyser import DistanceParams, HDBSCANParams
 from beqanalyser.analyser import (
     build_all_composites,
 )
+from beqanalyser.filter import fit_all_composites_to_geq
 from beqanalyser.loader import load, load_or_compute_distance_matrix
 from beqanalyser.reporter import (
     plot_assigned_fan_curves,
@@ -16,6 +17,7 @@ from beqanalyser.reporter import (
     print_assignments,
     summarise_assignments,
     summarise_result,
+    plot_filter_comparison,
 )
 
 if __name__ == "__main__":
@@ -77,14 +79,16 @@ if __name__ == "__main__":
         full_distance_matrix=full_distance_matrix,
         final_assignment_threshold_multiplier=1.0,
     )
-
-    plot_distance_histograms(result.composites)
+    in_band_freqs = freqs[(freqs >= min_freq) & (freqs <= max_freq)]
+    geq_fit = fit_all_composites_to_geq(result.composites, in_band_freqs)
+    plot_filter_comparison(geq_fit)
+    # plot_distance_histograms(result.composites)
     # plot_rms_max_scatter(result.composites)
-    plot_assigned_fan_curves(
-        result.composites, freqs[(freqs >= min_freq) & (freqs <= max_freq)]
-    )
-    print_assignments(result.composites, catalogue)
-    summarise_result(result)
-    for i, c in enumerate(result.calculations, start=1):
-        summarise_assignments(i, c, level=logging.INFO)
-    plot_composite_evolution(result, freqs, band=(min_freq, max_freq))
+    # plot_assigned_fan_curves(
+    #     result.composites, freqs[(freqs >= min_freq) & (freqs <= max_freq)]
+    # )
+    # print_assignments(result.composites, catalogue)
+    # summarise_result(result)
+    # for i, c in enumerate(result.calculations, start=1):
+    #     summarise_assignments(i, c, level=logging.INFO)
+    # plot_composite_evolution(result, freqs, band=(min_freq, max_freq))
