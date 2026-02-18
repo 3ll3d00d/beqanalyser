@@ -9,6 +9,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass, field, fields
+from typing import Protocol, override
 
 import numpy as np
 from scipy import optimize, signal
@@ -25,8 +26,21 @@ def q_from_octave_bandwidth(bw: float = 1.0 / 3.0) -> float:
     return 1.0 / (2 ** (bw / 2) - 2 ** (-bw / 2))
 
 
+class TableRowConvertible(Protocol):
+    """Protocol for objects that can be displayed in a table."""
+
+    @classmethod
+    def column_labels(cls) -> list[str]:
+        """Return the column labels for the table header."""
+        ...
+
+    def as_row(self) -> list[str]:
+        """Return the object's data as a list of strings for a table row."""
+        ...
+
+
 @dataclass
-class BiquadFilter:
+class BiquadFilter(TableRowConvertible):
     """Complete biquad filter with parameters and coefficients."""
 
     filter_type: str  # 'lowshelf', 'peaking', 'highshelf'
@@ -47,12 +61,14 @@ class BiquadFilter:
             elif self.filter_type == "peaking":
                 self.coefficients = peaking_rbj(self.fc, self.gain_db, self.q, self.fs)
 
+    @override
     def __repr__(self) -> str:
         return (
             f"BiquadFilter({self.filter_type}, fc={self.fc:.1f}Hz, "
             f"gain={self.gain_db:.2f}dB, Q={self.q:.3f})"
         )
 
+    @override
     def as_row(self):
         row = []
         for f in fields(self):
@@ -62,6 +78,7 @@ class BiquadFilter:
                 row.append(fmt.format(value))
         return row
 
+    @override
     @classmethod
     def column_labels(cls):
         return [
@@ -72,13 +89,14 @@ class BiquadFilter:
 
 
 @dataclass
-class GraphicEQBand:
+class GraphicEQBand(TableRowConvertible):
     """A single band in a graphic equaliser."""
 
     fc: float = field(metadata={"fmt": "{:.1f} Hz"})  # Centre frequency in Hz
     gain_db: float = field(metadata={"fmt": "{:.2f} dB"})  # Gain in dB
     width: float = 1.0 / 3.0
 
+    @override
     def __repr__(self) -> str:
         return f"GraphicEQ(fc={self.fc:.1f}Hz, gain={self.gain_db:.2f}dB"
 
@@ -90,6 +108,25 @@ class GraphicEQBand:
             q=q_from_octave_bandwidth(self.width),
             fs=fs,
         )
+
+    @override
+    def as_row(self):
+        row = []
+        for f in fields(self):
+            if "fmt" in f.metadata:
+                value = getattr(self, f.name)
+                fmt = f.metadata.get("fmt", "{}")
+                row.append(fmt.format(value))
+        return row
+
+    @override
+    @classmethod
+    def column_labels(cls):
+        return [
+            f.name
+            for f in fields(cls)
+            if "fmt" in f.metadata
+        ]
 
 
 def lowshelf_rbj(fc: float, gain_db: float, q: float, fs: float) -> BiquadCoefficients:
@@ -645,7 +682,10 @@ def fit_all_composites_to_peq(
 
 
 def fit_all_composites_to_geq(
-    composites: list[BEQComposite], freqs: np.ndarray, fs: float = 48000.0, smoothing: float = 1.0
+    composites: list[BEQComposite],
+    freqs: np.ndarray,
+    fs: float = 48000.0,
+    smoothing: float = 1.0,
 ) -> dict:
     """
     Fit graphic eq filters to all composite curves from BEQ analysis.
@@ -666,7 +706,9 @@ def fit_all_composites_to_geq(
         )
 
         # Fit filters to this composite
-        filters: list[BiquadFilter] = fit_composite_to_geq(comp.mag_response, freqs, fs, smoothing=smoothing)
+        filters: list[BiquadFilter] = fit_composite_to_geq(
+            comp.mag_response, freqs, fs, smoothing=smoothing
+        )
 
         # Compute final fit quality
         fitted_response: np.ndarray = compute_filter_response(filters, freqs, fs)
@@ -688,6 +730,28 @@ def fit_all_composites_to_geq(
         }
 
     return results
+
+
+def fit_all_composites_to_mag(
+    composites: list[BEQComposite], freqs: np.ndarray
+) -> dict:
+    """
+    Simply prints the magnitude response of each composite at 1/3 octave frequency points.
+
+    Args:
+        composites: List of BEQComposite objects from analyser.py
+        freqs: Frequency array in Hz (should match the band used in analysis)
+
+    Returns:
+        Dictionary mapping composite_id to list of GraphicEQBand objects
+    """
+    return {
+        comp.id: {
+            "freqs": freqs,
+            "filters": fit_composite_to_mag(comp.mag_response, freqs),
+        }
+        for comp in composites
+    }
 
 
 def export_filters_to_text(results: dict, freqs: np.ndarray) -> str:
@@ -885,4 +949,15 @@ def fit_composite_to_geq(
     return [
         GraphicEQBand(freq, gain).as_biquad(fs)
         for freq, gain in zip(band_freqs, result.x)
+    ]
+
+
+def fit_composite_to_mag(
+    target_db: np.ndarray, target_freqs: np.ndarray
+) -> list[GraphicEQBand]:
+    return [
+        GraphicEQBand(freq, np.interp(freq, target_freqs, target_db))
+        for freq in generate_third_octave_frequencies(
+            np.min(target_freqs) * 0.8, np.max(target_freqs) * 1.2
+        )
     ]

@@ -1,7 +1,6 @@
 import logging
 import math
 
-import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.axes import Axes
@@ -14,7 +13,7 @@ from beqanalyser import (
     BEQFilter,
     BEQResult,
 )
-from beqanalyser.filter import BiquadFilter
+from beqanalyser.filter import TableRowConvertible
 
 logger = logging.getLogger()
 
@@ -461,7 +460,7 @@ def plot_filter_comparison(
     plt.show()
 
 
-def show_filters(filter_sets: dict[str, list[BiquadFilter]]):
+def show_filters(filter_sets: dict[str, list[TableRowConvertible]]):
     n = len(filter_sets)
 
     cols = math.ceil(math.sqrt(n))
