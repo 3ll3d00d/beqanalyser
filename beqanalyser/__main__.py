@@ -1,6 +1,7 @@
 import logging
 import sys
 from collections import defaultdict
+from pathlib import Path
 
 import numpy as np
 
@@ -18,6 +19,7 @@ from beqanalyser.reporter import (
     summarise_assignments,
     summarise_result,
     plot_filter_comparison,
+    dump_filter_delta,
 )
 
 if __name__ == "__main__":
@@ -80,8 +82,9 @@ if __name__ == "__main__":
         final_assignment_threshold_multiplier=1.0,
     )
     in_band_freqs = freqs[(freqs >= min_freq) & (freqs <= max_freq)]
-    geq_fit = fit_all_composites_to_geq(result.composites, in_band_freqs)
-    plot_filter_comparison(geq_fit)
+    # geq_fit = fit_all_composites_to_geq(result.composites, in_band_freqs)
+    # plot_filter_comparison(geq_fit)
+    dump_filter_delta(result.composites, catalogue, Path('.'))
     # plot_distance_histograms(result.composites)
     # plot_rms_max_scatter(result.composites)
     # plot_assigned_fan_curves(

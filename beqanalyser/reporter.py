@@ -1,5 +1,6 @@
 import logging
 import math
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -536,3 +537,34 @@ def show_filters(filter_sets: dict[str, list[TableRowConvertible]]):
         ax.axis("off")
 
     plt.show()
+
+
+def dump_filter_delta(composites: list[BEQComposite], filters: list[BEQFilter], root_dir: Path) -> None:
+    for c in composites:
+        m = next((m for m in c.mappings if m.is_best and not m.rejected), None)
+        if m:
+            beq: BEQFilter = filters[m.entry_id]
+            comp_response = c.mag_response
+            beq_response = beq.mag_db
+
+            # Generate matplotlib chart
+            fig, ax = plt.subplots(figsize=(10, 6))
+
+            # Plot the delta
+            delta = comp_response - beq_response
+            ax.plot(delta, label='Delta', color='green', linewidth=1, linestyle='--')
+
+            # Formatting
+            ax.set_xlim(1, 80)
+            ax.set_xlabel('Frequency (Hz))')
+            ax.set_ylabel('Magnitude (dB)')
+            ax.set_title(f'{beq.entry.author} - {beq.entry.formatted_title}')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+            # Save the image
+            output_dir = root_dir / beq.entry.digest
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output_path = output_dir / 'composite_delta.png'
+            plt.savefig(output_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)

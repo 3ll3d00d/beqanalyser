@@ -591,6 +591,7 @@ def build_beq_composites(
         input_curves: Full frequency response database
         entry_ids: ids of the input curves
         freqs: Frequency array
+        distance_params: Parameters controlling distance computation and limits
         hdbscan_params: HDBSCAN parameters
         weights: Optional frequency weights
         band: Frequency band to analyze (min_freq, max_freq)
